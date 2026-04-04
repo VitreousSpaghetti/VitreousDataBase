@@ -1,0 +1,14 @@
+{
+  "name": "vitreousdatabase",
+  "version": "0.1.0",
+  "description": "A JSON-file-backed non-relational database module for Node.js",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --test test/database.test.js test/entity.test.js test/record.test.js)",
+      "Bash(node --test test/entity.test.js)",
+      "Bash(node --test test/validator.test.js test/database.test.js test/entity.test.js test/record.test.js)"
+    ]
+  }
+}
