@@ -215,25 +215,25 @@ describe('BUG 5 — tabella senza id fields rifiutata (fixed)', () => {
 
   afterEach(() => teardown(db, tmpDir));
 
-  test('createEntity type:table senza id lancia TypeError', async () => {
+  test('createEntity type:table senza id lancia InvalidIdError', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('log', {
         type: 'table',
         values: ['msg', 'level'],
         // id non fornito — default []
       }),
-      TypeError
+      InvalidIdError
     );
   });
 
-  test('createEntity type:table con id:[] lancia TypeError', async () => {
+  test('createEntity type:table con id:[] lancia InvalidIdError', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('log', {
         type: 'table',
         id: [],
         values: ['msg'],
       }),
-      TypeError
+      InvalidIdError
     );
   });
 
@@ -468,14 +468,14 @@ describe('BUG-01 sesta tornata — unique su entità "object" lancia TypeError',
   beforeEach(async () => ({ db, tmpDir } = await freshDb()));
   afterEach(() => teardown(db, tmpDir));
 
-  test('createEntity object con unique lancia TypeError', async () => {
+  test('createEntity object con unique lancia InvalidIdError', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('addr', {
         type: 'object',
         values: ['street', 'city'],
         unique: ['city'],
       }),
-      TypeError
+      InvalidIdError
     );
   });
 

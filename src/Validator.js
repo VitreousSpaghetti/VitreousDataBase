@@ -110,7 +110,9 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
 
   // 3. unique — nested fields use deep equality; primitives use strict equality
   const nested = config.nested || [];
-  const existing = data.entities[entityName] || [];
+  const existing = Object.prototype.hasOwnProperty.call(data.entities, entityName)
+    ? data.entities[entityName]
+    : [];
 
   // 3a. Composite id uniqueness — id fields are unique as a tuple, not individually
   const idFields = config.id || [];

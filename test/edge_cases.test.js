@@ -49,6 +49,7 @@ const {
   NestedTypeError,
   FileAccessError,
   InvalidIdError,
+  UnknownFieldError,
 } = require('../src/errors');
 const { Database } = require('../index');
 
@@ -233,25 +234,25 @@ describe('EntityManager — createEntity config validation', () => {
     );
   });
 
-  test('throws TypeError when notnullable field is not in values', async () => {
+  test('throws UnknownFieldError when notnullable field is not in values', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('items', {
         type: 'table',
         values: ['id', 'name'],
         notnullable: ['missing'],
       }),
-      TypeError
+      UnknownFieldError
     );
   });
 
-  test('throws TypeError when unique field is not in values', async () => {
+  test('throws UnknownFieldError when unique field is not in values', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('items', {
         type: 'table',
         values: ['id', 'name'],
         unique: ['missing'],
       }),
-      TypeError
+      UnknownFieldError
     );
   });
 
@@ -458,14 +459,14 @@ describe('RecordManager — entity with no id field', () => {
   beforeEach(setup);
   afterEach(cleanup);
 
-  test('createEntity table senza id field lancia TypeError', async () => {
+  test('createEntity table senza id field lancia InvalidIdError', async () => {
     await assert.rejects(
       () => db.entityManager.createEntity('logs', {
         type: 'table',
         values: ['msg', 'level'],
         notnullable: ['msg'],
       }),
-      TypeError
+      InvalidIdError
     );
   });
 });

@@ -6,6 +6,7 @@ const {
   EntityTypeError,
   EntityInUseError,
   InvalidIdError,
+  UnknownFieldError,
 } = require('./errors');
 const { detectCircularReference } = require('./Validator');
 
@@ -35,8 +36,9 @@ class EntityManager {
         throw new TypeError('Entity name must be a non-empty string');
       }
 
-      // 2. name must not already exist
-      if (data.entitiesConfiguration[name]) {
+      // 2. name must not already exist — use hasOwnProperty to avoid false positives
+      //    for reserved names like '__proto__' that resolve to Object.prototype
+      if (Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, name)) {
         throw new EntityAlreadyExistsError(name);
       }
 
@@ -83,12 +85,10 @@ class EntityManager {
       const allArrays = { id, notnullable, unique, nested };
 
       // 5. All extra fields must be subsets of values
-      for (const [arrayName, arr] of Object.entries(allArrays)) {
+      for (const [, arr] of Object.entries(allArrays)) {
         for (const field of arr) {
           if (!values.includes(field)) {
-            throw new TypeError(
-              `Entity "${name}": field "${field}" in "${arrayName}" is not in "values"`
-            );
+            throw new UnknownFieldError(name, field);
           }
         }
       }
@@ -107,14 +107,12 @@ class EntityManager {
 
       // 7b. object entities cannot declare unique constraints (validateNestedObject never applies them)
       if (type === 'object' && unique.length > 0) {
-        throw new TypeError(
-          `Entity "${name}" of type "object" cannot declare "unique" constraints`
-        );
+        throw new InvalidIdError(name, 'object entities cannot declare unique constraints');
       }
 
       // 8. table entities must declare at least one id field
       if (type === 'table' && id.length === 0) {
-        throw new TypeError(`Entity "${name}" of type "table" must declare at least one id field`);
+        throw new InvalidIdError(name, 'table entities must declare at least one id field');
       }
 
       // Normalize: id fields automatically added to notnullable.
@@ -143,8 +141,10 @@ class EntityManager {
       snapshot.entitiesConfiguration[name] = finalConfig;
       detectCircularReference(name, snapshot);
 
-      // 11. Persist
-      data.entitiesConfiguration[name] = finalConfig;
+      // 11. Persist — use defineProperty to safely handle reserved names like '__proto__'
+      Object.defineProperty(data.entitiesConfiguration, name, {
+        value: finalConfig, writable: true, enumerable: true, configurable: true,
+      });
       await this._db._write(data);
 
       return finalConfig;
@@ -160,9 +160,10 @@ class EntityManager {
   async getEntity(name) {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
-      const config = data.entitiesConfiguration[name];
-      if (!config) throw new EntityNotFoundError(name);
-      return JSON.parse(JSON.stringify(config));
+      if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, name)) {
+        throw new EntityNotFoundError(name);
+      }
+      return JSON.parse(JSON.stringify(data.entitiesConfiguration[name]));
     });
   }
 
@@ -191,8 +192,10 @@ class EntityManager {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
 
+      if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, name)) {
+        throw new EntityNotFoundError(name);
+      }
       const config = data.entitiesConfiguration[name];
-      if (!config) throw new EntityNotFoundError(name);
 
       if (config.type === 'object') {
         const referencedBy = Object.entries(data.entitiesConfiguration)

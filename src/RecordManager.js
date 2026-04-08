@@ -68,8 +68,10 @@ class RecordManager {
   }
 
   _getTableConfig(data, entityName) {
+    if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
+      throw new EntityNotFoundError(entityName);
+    }
     const config = data.entitiesConfiguration[entityName];
-    if (!config) throw new EntityNotFoundError(entityName);
     if (config.type !== 'table') throw new EntityTypeError(entityName, 'table', config.type);
     return config;
   }
@@ -87,7 +89,11 @@ class RecordManager {
       this._getTableConfig(data, entityName);
       const record = normalizeMinusZero(rawRecord);
       validateRecord(entityName, record, data);
-      if (!data.entities[entityName]) data.entities[entityName] = [];
+      if (!Object.prototype.hasOwnProperty.call(data.entities, entityName)) {
+        Object.defineProperty(data.entities, entityName, {
+          value: [], writable: true, enumerable: true, configurable: true,
+        });
+      }
       const clone = JSON.parse(JSON.stringify(record));
       data.entities[entityName].push(clone);
       await this._db._write(data);
@@ -111,7 +117,7 @@ class RecordManager {
       validateFullIdObject(entityName, idObject, config);
 
       const idKeys = Object.keys(idObject);
-      const records = data.entities[entityName] || [];
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : [];
       const found = records.find(r =>
         idKeys.every(k => r[k] === idObject[k])
       );
@@ -140,7 +146,7 @@ class RecordManager {
       }
 
       const idField = config.id[0];
-      const records = data.entities[entityName] || [];
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : [];
       const found = records.find(r => r[idField] === value);
       return found ? JSON.parse(JSON.stringify(found)) : null;
     });
@@ -156,7 +162,7 @@ class RecordManager {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
       this._getTableConfig(data, entityName);
-      return JSON.parse(JSON.stringify(data.entities[entityName] || []));
+      return JSON.parse(JSON.stringify(Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : []));
     });
   }
 
@@ -172,7 +178,7 @@ class RecordManager {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
       this._getTableConfig(data, entityName);
-      const records = data.entities[entityName] || [];
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : [];
 
       let matchFn;
       if (typeof predicate === 'function') {
@@ -211,7 +217,7 @@ class RecordManager {
       validateFullIdObject(entityName, idObject, config);
 
       const idKeys = Object.keys(idObject);
-      const records = data.entities[entityName] || [];
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : [];
       const idx = records.findIndex(r => idKeys.every(k => r[k] === idObject[k]));
 
       if (idx === -1) {
@@ -246,7 +252,7 @@ class RecordManager {
       validateFullIdObject(entityName, idObject, config);
 
       const idKeys = Object.keys(idObject);
-      const records = data.entities[entityName] || [];
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName) ? data.entities[entityName] : [];
       const idx = records.findIndex(r => idKeys.every(k => r[k] === idObject[k]));
 
       if (idx === -1) {

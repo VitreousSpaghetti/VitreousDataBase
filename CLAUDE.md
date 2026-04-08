@@ -13,16 +13,22 @@ A Node.js module (CommonJS, zero runtime dependencies) that uses a JSON file as 
 ## File map
 
 ```
-index.js                  public entry point — re-exports Database + all error classes
-src/errors.js             all custom error classes (extend VitreousError)
-src/Validator.js          pure validation functions — no side effects, no I/O
-src/Database.js           file I/O, eager mode, intra-process mutex
-src/EntityManager.js      schema CRUD (createEntity, getEntity, listEntities, deleteEntity)
-src/RecordManager.js      data CRUD (insert, findById, findByIdSingle, findAll, findWhere, update, deleteRecord)
-test/validator.test.js    unit tests for Validator.js
-test/database.test.js     integration tests for Database init and eager mode
-test/entity.test.js       integration tests for EntityManager
-test/record.test.js       integration tests for RecordManager
+index.js                    public entry point — re-exports Database + all error classes
+src/errors.js               all custom error classes (extend VitreousError)
+src/Validator.js            pure validation functions — no side effects, no I/O
+src/Database.js             file I/O, eager mode, intra-process mutex
+src/EntityManager.js        schema CRUD (createEntity, getEntity, listEntities, deleteEntity)
+src/RecordManager.js        data CRUD (insert, findById, findByIdSingle, findAll, findWhere, update, deleteRecord)
+test/validator.test.js      unit tests for Validator.js
+test/database.test.js       integration tests for Database init and eager mode
+test/entity.test.js         integration tests for EntityManager
+test/record.test.js         integration tests for RecordManager
+test/bugs.test.js           regression tests for known bug fixes
+test/edge_cases.test.js     boundary and edge case coverage
+test/persistence.test.js    persistence and error property checks
+test/integration.test.js    end-to-end scenarios
+test/adversarial.test.js    adversarial inputs (prototype pollution, invalid schemas, etc.)
+test/readme.test.js         verifies README examples work correctly
 ```
 
 ---
@@ -50,6 +56,18 @@ test/record.test.js       integration tests for RecordManager
 - `"table"` entities store records in `entities[name][]`
 - `"object"` entities are schema-only; they have no entry in `entities` and cannot be inserted directly
 - `nested` field names must each correspond to a registered `"object"` entity; name matching is by convention (field name === entity name). This means two fields of the same type within one entity are not expressible — each field name must match a distinct `"object"` entity name.
+
+**Constraints by entity type:**
+
+| Field | `"table"` | `"object"` |
+|-------|-----------|------------|
+| `id` | required (≥1 field) | not allowed |
+| `values` | required | required |
+| `notnullable` | optional | optional |
+| `unique` | optional | not allowed |
+| `nested` | optional | optional |
+
+`"object"` entities without `id` or `unique` are validated only for structure (unknown fields, notnullable, nested type). Passing `id` or `unique` to an `"object"` entity throws at `createEntity` time (once enforced — see known failing tests).
 
 ---
 
@@ -84,9 +102,9 @@ Order of checks:
 5. All `unique` fields have no duplicate in existing records; nested fields use deep equality (`deepEqual`), primitives use `Object.is`; in update mode, `existingRecord` is excluded from the comparison
 6. All `nested` fields present in the record are plain objects; each is recursively validated via `validateNestedObject`
 
-### `validateNestedObject(nestedEntityName, value, data)`
+### `validateNestedObject(nestedEntityName, value, data, _visited = new Set())`
 
-Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, non-JSON-serializable numbers (NaN/Infinity/-Infinity), notnullable. No unique check. Recurses into further nested fields.
+Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, non-JSON-serializable numbers (NaN/Infinity/-Infinity), notnullable. No unique check. Recurses into further nested fields. `_visited` is an internal parameter used to detect circular references at validation time — do not pass it from outside the function.
 
 ### `detectCircularReference(entityName, data, visited = new Set())`
 
@@ -197,7 +215,7 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 node --test test/*.test.js
 ```
 
-Expected: **262 tests, 0 failures**.
+Expected: **318 tests, 0 failures**.
 
 The test suite includes:
 - `test/validator.test.js` — unit tests for Validator.js
@@ -208,4 +226,6 @@ The test suite includes:
 - `test/edge_cases.test.js` — boundary and edge case coverage
 - `test/persistence.test.js` — persistence and error property checks
 - `test/integration.test.js` — end-to-end scenarios
+- `test/adversarial.test.js` — adversarial inputs and invariant enforcement
 - `test/readme.test.js` — verifies README examples work correctly
+

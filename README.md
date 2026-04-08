@@ -16,7 +16,7 @@ Copy the module into your project or install it locally:
 
 ```bash
 # from a local path
-npm install vitreousdatabase
+npm install ./path/to/VitreousDataBase
 ```
 
 Then require it:
@@ -207,6 +207,8 @@ const customer = await db.recordManager.findByIdSingle('customers', 1);
 
 Returns `null` if no record matches. Throws `InvalidIdError` if the entity has a composite id. Throws `EntityTypeError` if called on an `"object"` entity.
 
+> **Note:** Same strict type comparison as `findById` — `findByIdSingle('users', '1')` will not match a record with `id: 1` (number).
+
 ### `findAll(entityName)`
 
 Returns all records for an entity. Throws `EntityTypeError` if called on an `"object"` entity.
@@ -222,7 +224,7 @@ Filters records. Accepts either a **function** or a **plain object**.
 ```js
 // Function predicate — full power, supports nested access
 const rich = await db.recordManager.findWhere('customers', r => r.total > 1000);
-const milanese = await db.recordManager.findWhere('customers', r => r.address?.city === 'Milano');
+const milaneseByFn = await db.recordManager.findWhere('customers', r => r.address?.city === 'Milano');
 
 // Plain object — deep equality, supports nested fields
 const alices = await db.recordManager.findWhere('customers', { name: 'Alice' });
@@ -257,6 +259,7 @@ await db.recordManager.update('customers', { id: 1 }, {
 - Throws `RecordNotFoundError` if no record matches `idObject`.
 - All validation rules (notnullable, unique, unknown fields) apply to the merged result. Unknown fields in `updates` are caught by the unknown-field check and throw `UnknownFieldError`.
 - **Array fields are replaced entirely**, not merged element-by-element. Only plain object fields are deep-merged.
+- **`undefined` values in `updates` are dropped silently** after the JSON round-trip. If a field in `updates` is `undefined` and that field is `notnullable`, validation will throw `NullConstraintError`. If it is not `notnullable`, the field will disappear from the stored record. Use `null` to explicitly clear a nullable field.
 
 ### `deleteRecord(entityName, idObject)`
 
