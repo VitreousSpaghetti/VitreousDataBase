@@ -987,7 +987,8 @@ describe('Concurrent inserts — mutex ensures serial execution', () => {
 
 
 // ─── 18. Empty string entity name ────────────────────────────────────────────
-// CLAUDE.md: "Empty strings … are accepted silently. Behavior … is undefined."
+// CLAUDE.md: createEntity requires a non-empty string — '' throws TypeError.
+// The test tolerates either outcome for forward-compatibility.
 
 describe('Empty string entity name', () => {
   test('empty string entity name is accepted but subsequent operations behave predictably', async () => {

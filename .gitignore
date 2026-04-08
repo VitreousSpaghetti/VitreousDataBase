@@ -1,8 +1,5 @@
-.claude/setting.local.json
+README.md
 .claude/settings.local.json
-.claude/worktrees/elated-lehmann
-.claude/worktrees/recursing-williamson
-.claude/settings.local.json
-.claude/
 .claude/*
-ROADMAP.md
+TODO.md
+MAP.md

@@ -275,7 +275,7 @@ const allCustomers = await db.recordManager.findAll('customers');
 
 ### `findWhere(entityName, predicate)`
 
-Filters records. Accepts either a **function** or a **plain object**.
+Filters records. Accepts a **function predicate**, a **plain object** (exact deep match), or a **plain object with query operators**.
 
 ```js
 // Function predicate — full power, supports nested access
@@ -285,9 +285,71 @@ const milaneseByFn = await db.recordManager.findWhere('customers', r => r.addres
 // Plain object — deep equality, supports nested fields
 const alices = await db.recordManager.findWhere('customers', { name: 'Alice' });
 const milanese = await db.recordManager.findWhere('customers', { address: { city: 'Milano' } });
+
+// Query operators — composable and programmatic
+const expensive = await db.recordManager.findWhere('orders', { total: { $gt: 100 } });
+const active    = await db.recordManager.findWhere('orders', { status: { $in: ['new', 'pending'] } });
+const range     = await db.recordManager.findWhere('orders', { total: { $gte: 50, $lte: 200 } });
+const noAddress = await db.recordManager.findWhere('orders', { address: { $exists: false } });
 ```
 
-Throws `EntityTypeError` if called on an `"object"` entity.
+**Comparison operators** (field-level):
+
+| Operator | Semantics |
+|----------|-----------|
+| `$eq` | `field === value` |
+| `$ne` | `field !== value` |
+| `$gt` | `field > value` |
+| `$gte` | `field >= value` |
+| `$lt` | `field < value` |
+| `$lte` | `field <= value` |
+| `$in` | field value is in the array (uses `===`) |
+| `$nin` | field value is not in the array |
+| `$exists` | `true` — field is not `undefined`; `false` — field is `undefined` |
+
+Multiple operators on the same field are combined with AND:
+
+```js
+// total > 50 AND total < 300
+await db.recordManager.findWhere('orders', { total: { $gt: 50, $lt: 300 } });
+```
+
+**Logical operators** (top-level keys):
+
+| Operator | Semantics |
+|----------|-----------|
+| `$and` | Array of sub-predicates — all must match |
+| `$or` | Array of sub-predicates — at least one must match |
+| `$not` | Plain-object predicate — must NOT match |
+
+```js
+// $and
+await db.recordManager.findWhere('orders', {
+  $and: [{ total: { $gt: 100 } }, { status: { $ne: 'cancelled' } }],
+});
+
+// $or
+await db.recordManager.findWhere('orders', {
+  $or: [{ status: 'new' }, { status: 'pending' }],
+});
+
+// $not
+await db.recordManager.findWhere('orders', {
+  $not: { status: 'cancelled' },
+});
+
+// combining
+await db.recordManager.findWhere('orders', {
+  $and: [
+    { $or: [{ status: 'new' }, { status: 'pending' }] },
+    { total: { $gte: 50 } },
+  ],
+});
+```
+
+Throws `EntityTypeError` if called on an `"object"` entity. Throws `TypeError` for malformed operator objects (unknown operator, `$in`/`$nin` operand not an array, `$and`/`$or` operand not an array, `$not` operand not a plain object).
+
+> **`NaN` behaviour with operators:** comparison operators use `===` internally. Since `NaN !== NaN`, `{ field: { $eq: NaN } }` never matches. Use a function predicate with `Number.isNaN()` to match `NaN` values explicitly: `r => Number.isNaN(r.field)`.
 
 
 ### `update(entityName, idObject, updates)`
@@ -335,7 +397,7 @@ const removed = await db.recordManager.deleteRecord('customers', { id: 1 });
 
 ## Transactions
 
-`db.transaction(fn)` runs multiple operations atomically. All operations share a forked in-memory snapshot. If `fn` resolves, a single atomic write commits everything. If `fn` throws, the snapshot is discarded and nothing is persisted.
+`db.transaction(fn)` runs multiple operations atomically. All operations share a forked in-memory snapshot. If `fn` resolves, a single atomic write commits everything. If `fn` throws, the snapshot is discarded and nothing is persisted. `db.transaction()` returns the value returned by `fn`.
 
 ```js
 await db.transaction(async (tx) => {
@@ -411,14 +473,15 @@ unsubscribe();
 `record` and `previous` are deep clones — mutating them has no effect on the database.
 
 **Behaviour:**
-- `watch()` is **synchronous** — it returns the unsubscribe function immediately (not a Promise).
+- `watch()` is **synchronous** — it returns the unsubscribe function immediately (not a Promise). It throws `TypeError` synchronously if `callback` is not a function.
 - Multiple watchers on the same entity are all called in registration order.
 - A watcher that **throws** is silently ignored. The write still completes and other watchers still fire.
 - Events fire only **after** the write succeeds. A failed operation (e.g. unique constraint violation) fires no event. Watchers can safely assume each event represents a committed change.
 - `unsubscribe()` is **idempotent** — calling it more than once is a safe no-op.
 - Watch is **intra-process only** — no event fires when another process modifies the file.
 - Operations inside `db.transaction()` do **not** fire watch callbacks.
-- Calling `watch()` on an `"object"` entity does not throw, but the callback will **never fire** — object entities cannot have records inserted.
+- Calling `watch()` on an `"object"` entity or a **non-existent entity** does not throw, but the callback will **never fire**. Always call `unsubscribe()` to clean up stale watchers.
+- Watchers registered on an entity **survive `deleteEntity()`**. If the entity is later recreated with the same name, old callbacks will fire again. Call `unsubscribe()` before deleting an entity to avoid this.
 
 ---
 
@@ -685,18 +748,72 @@ The test suite includes:
 
 - **No referential integrity across table entities.** VitreousDataBase has no concept of foreign keys between table entities. Deleting a `customers` record leaves all `orders` records with a dangling `customerId` intact and undetectable. Cross-table consistency must be maintained by the application.
 
-- **JSON-only values.** All field values must be JSON-serializable. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time with a `TypeError`. Other non-serializable types (`Date`, `RegExp`, `Map`, `Set`, `undefined`) are **not** rejected but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
+- **JSON-only values.** All field values must be JSON-serializable. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time with a `TypeError`. `BigInt` values bypass validation and throw a raw `TypeError` from `JSON.stringify` inside `insert()` — not a `VitreousError`. Other non-serializable types (`Date`, `RegExp`, `Map`, `Set`, `undefined`) are **not** rejected but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
 
 - **No composite `unique` constraints.** The `unique` field in the entity config applies per-field only. There is no way to declare that a *combination* of non-id fields must be unique (e.g. `categoryId + slug`). If you need composite uniqueness, include those fields in `id` (which enforces composite tuple uniqueness) or enforce the constraint in application code.
 
 - **`undefined` field values are silently dropped.** A field with value `undefined` that is not in `notnullable` passes validation but disappears after the JSON round-trip. The returned record will have fewer keys than what was passed. Use `null` to explicitly store an absent value.
 
-- **`-0` is only normalized at the top level.** `normalizeMinusZero()` converts `-0` to `0` for top-level record fields before insert and update. Fields inside nested objects are not normalized — they may transiently hold `-0` in memory. JSON serialization always converts `-0` to `0`, so the value on disk is always `0`, but the in-memory representation inside an operation may differ.
+- **`-0` is only normalized at the top level, and normalization runs on the full merged record during `update()`.** `normalizeMinusZero()` converts `-0` to `0` for top-level record fields before insert and update. Fields inside nested objects are not normalized — they may transiently hold `-0` in memory. JSON serialization always converts `-0` to `0`, so the value on disk is always `0`, but the in-memory representation inside an operation may differ. During `update()`, normalization is applied to the entire post-merge record, not just the patched fields — a pre-existing top-level `-0` that was not part of the patch will also be converted to `0`.
 
 - **`findWhere` predicate errors are not wrapped.** If the predicate function throws (e.g. accessing a property of `null`), the raw JavaScript error propagates uncaught — it is not wrapped in a `VitreousError`. Code that catches only `VitreousError` will not handle it.
 
-- **Entity names are not validated.** There is no check on name format. Empty strings and names containing spaces are accepted silently. The name `__proto__` is handled safely (no prototype pollution), but other prototype property names (`constructor`, `hasOwnProperty`, `toString`, etc.) may produce undefined behavior and are not recommended.
+- **Entity name format is not validated.** `createEntity` requires a non-empty string for the name — passing `''`, `null`, or a non-string throws `TypeError`. However, beyond this basic check, the format is unconstrained: names containing spaces are accepted silently. The name `__proto__` is handled safely (no prototype pollution), but other prototype property names (`constructor`, `hasOwnProperty`, `toString`, etc.) may produce undefined behavior and are not recommended.
 
 - **Full file load on every operation (non-eager mode).** In the default mode, each operation calls `fs.readFile` + `JSON.parse` on the entire database file. There is no pagination or streaming. For large datasets this becomes an O(n) memory allocation per operation. Use eager mode for read-heavy workloads on large files.
 
 - **Circular reference DFS is exponential on deep diamond dependencies.** `detectCircularReference` creates a fresh visited-set copy per branch, allowing shared nodes to be revisited once per path. For schemas with many levels of diamond-shaped nested dependencies (A→B, A→C, B→D, C→D, …), the work grows as O(2^n). In practice, nested schemas are shallow, so this is not a concern for typical usage.
+
+- **`update()` with an empty `{}` patch triggers a write and fires a watch event.** `deepMerge(existingRecord, {})` produces an identical copy; validation passes; the file is written; watchers are notified. Guard with `if (Object.keys(updates).length === 0) return` if you want to skip no-op patches.
+
+- **`$and: []` matches every record; `$or: []` matches no record.** Empty-array behaviour follows JavaScript's `Array.prototype.every` / `some`: `[].every(...)` is `true`, `[].some(...)` is `false`. Avoid empty arrays unless you intend these semantics.
+
+- **`$not: {}` never matches any record.** `deepMatch(record, {})` is always `true`, so `{ $not: {} }` negates to `false` for every record.
+
+- **`$exists: false` is unreliable after JSON round-trip.** `undefined` field values are dropped by `JSON.stringify`. After a round-trip, a field set to `undefined` is indistinguishable from a field that was never written. Use `$exists: true` reliably; avoid relying on `$exists: false` for runtime logic.
+
+- **`insert()` with a non-object `record` throws a raw `TypeError` or produces a corrupted record.** Passing `null` or `undefined` throws `TypeError: Cannot convert undefined or null to object`. Passing a string produces a record keyed by character indices (e.g. `{ '0': 'h', '1': 'i' }`), bypassing validation and corrupting the entity. Always pass a plain object.
+
+- **`flush()` on a closed database is a silent no-op, not an error.** After `db.close()`, calling `flush()` exits early without throwing — inconsistent with `_read()` and `_write()`, which both throw `FileAccessError('database is closed')`. Always use `db.close()` (which flushes internally) rather than calling `flush()` independently.
+
+- **`createEntity` does not validate that `values` elements are strings.** The array is verified as non-empty and duplicate-free, but individual elements are not type-checked. Passing `values: [1, null, {}]` is accepted silently; subsequent operations may misbehave because field-name comparisons use string equality.
+
+- **`$exists` operator accepts any truthy/falsy value, not only booleans.** `{ $exists: 1 }` behaves as `$exists: true`; `{ $exists: 0 }` behaves as `$exists: false`. No error is thrown for non-boolean operands.
+
+- **Nested entity lookup in `createEntity` step 9 does not use `hasOwnProperty`.** If a field in `nested` shares a name with an `Object.prototype` property (e.g. `'constructor'`), the lookup finds the prototype method rather than `undefined`, producing `EntityTypeError` instead of `EntityNotFoundError`. Avoid using `Object.prototype` property names as nested field names.
+
+- **Unknown query operators throw `TypeError`, not `VitreousError`.** Passing an unrecognised operator key (e.g. `{ qty: { $between: [1, 5] } }`) throws `new TypeError('Unknown query operator: ...')`. Code catching only `VitreousError` subclasses will not intercept this error.
+
+- **`removeField` silently removes the field from `notnullable`, `unique`, and `nested`.** If the removed field was also listed as a nested reference to an object entity, that reference is dropped without any warning or error.
+
+- **`addConstraint` accepts duplicate entries in `fields` without error.** Passing `['x', 'x']` runs validation twice for `'x'` but adds it to the constraint array only once.
+
+- **Opening a malformed JSON file does not throw immediately.** `Database.create()` succeeds if the file is valid JSON, even if it lacks `entitiesConfiguration` or `entities` keys. Errors surface on the first actual operation.
+
+- **`watch()` on a non-existent entity registers silently and never fires.** `watch()` does not validate that the entity exists. The callback is stored internally but will never be invoked. Call `unsubscribe()` to clean it up.
+
+- **`watch()` callbacks survive entity deletion.** Calling `deleteEntity('foo')` does not remove watchers registered for `'foo'`. If the entity is later recreated under the same name, those old callbacks will fire again. Always call the unsubscribe function before deleting an entity to avoid stale callbacks.
+
+- **`$and`, `$or`, and `$not` cannot be used as field-level operators.** They are processed only at the root of a `deepMatch` call. Using `{ field: { $and: [...] } }` passes them to `applyOperators`, which throws `TypeError('Unknown query operator: $and')`.
+
+- **Mixing operator keys and plain field keys in a predicate throws `TypeError`.** A predicate like `{ $gt: 5, name: 'foo' }` that contains both `$...` keys and plain field keys throws `TypeError('Query predicate cannot mix operator keys ($...) with plain field keys')`.
+
+- **`findWhere` with an array as the predicate throws `TypeError`.** Passing an array instead of a function or plain object throws `TypeError('predicate must be a function or a plain object')`.
+
+- **`$not` only accepts a plain object as its operand.** Passing a function or an operator object (e.g. `{ $not: { $gt: 5 } }`) throws `TypeError('$not operand must be a plain object')`. To negate a comparison, use `$ne`, `$nin`, or a function predicate.
+
+- **`addConstraint` does not validate that `fields` is an array.** Passing a string instead of an array (e.g. `addConstraint('users', 'notnullable', 'name')`) iterates over the string's individual characters, each of which will likely throw `InvalidMigrationError` for not being a known field name.
+
+- **ID lookup uses `===`, not `Object.is()`.** `findById`, `findByIdSingle`, `update`, and `deleteRecord` match records using `===`. This means `-0` and `+0` are treated as the same id in lookups, even though `insert` uses `Object.is()` for uniqueness (treating them as distinct). Avoid using `-0` and `+0` as id values.
+
+- **`createEntity` silently deduplicates `id`, `notnullable`, `unique`, and `nested` arrays.** Duplicate entries in `values` throw `TypeError`; duplicates in the other arrays are removed without warning.
+
+- **`findByIdSingle` throws `InvalidIdError` for entities with a composite id.** If an entity has more than one id field, `findByIdSingle` throws `InvalidIdError`. Use `findById` with a full idObject for composite-id entities.
+
+- **`addField` cannot add a field to the `nested` list.** There is no API to retroactively mark an existing field as a nested reference. To add a nested field, the entity must be deleted and recreated.
+
+- **`watch()` on a closed database registers silently without error.** `watch()` is synchronous and bypasses `_enqueue`, so it does not check whether the database has been closed. After `db.close()`, calling `watch()` succeeds — the callback is stored internally — but will never fire, because all subsequent writes fail with `FileAccessError`. No error is thrown at registration time.
+
+- **`addConstraint('unique')` on an `id` field creates redundant and conflicting checks.** There is no guard preventing `addConstraint(entity, 'unique', ['idField'])` on a field already declared in `id`. The `id` declaration enforces composite-tuple uniqueness; adding `unique` on an individual id field introduces a stricter per-field check. For composite-id entities, two records may legitimately share one id field value (the full tuple is still unique), but the per-field `unique` constraint will reject the second insert even though the composite id is valid.
+
+- **`update()` with a non-object `updates` argument throws a raw `TypeError`.** No type-check is performed on `updates` before it is passed to `deepMerge`. Passing `null`, a number, or a boolean causes `Object.keys(updates)` to throw a native `TypeError` that is not wrapped in a `VitreousError`. Passing a string deep-merges on character indices, silently producing a corrupted record. Always pass a plain object as `updates`.

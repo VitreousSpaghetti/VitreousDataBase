@@ -79,7 +79,7 @@ class Database {
   }
 
   _registerExitHandler() {
-    process.on('exit', () => {
+    this._exitHandler = () => {
       if (this._eager && this._dirty && this._cache !== null) {
         try {
           const tempPath = this._filePath + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
@@ -89,7 +89,8 @@ class Database {
           // best effort — cannot throw in exit handler
         }
       }
-    });
+    };
+    process.on('exit', this._exitHandler);
   }
 
   _enqueue(fn) {
@@ -101,10 +102,6 @@ class Database {
   async _read() {
     if (this._closed) throw new FileAccessError(this._filePath, 'database is closed');
     if (this._eager) {
-      if (this._cache === null) {
-        const raw = await fsPromises.readFile(this._filePath, 'utf8');
-        this._cache = JSON.parse(raw);
-      }
       return this._cache;
     }
     let raw;
@@ -149,7 +146,8 @@ class Database {
    * Watch callbacks registered on the real recordManager do NOT fire for
    * operations inside a transaction. Nested transactions are not supported.
    *
-   * @param {(tx: { entityManager: EntityManager, recordManager: RecordManager }) => Promise<void>} fn
+   * @param {(tx: { entityManager: EntityManager, recordManager: RecordManager }) => Promise<any>} fn
+   * @returns {Promise<any>} resolves with the return value of fn
    */
   async transaction(fn) {
     return this._enqueue(async () => {
@@ -170,9 +168,10 @@ class Database {
         recordManager: new RecordManager(txDb),
       };
 
-      await fn(tx);
+      const result = await fn(tx);
 
       await this._write(snapshot);
+      return result;
     });
   }
 
@@ -187,6 +186,10 @@ class Database {
   async close() {
     return this._enqueue(async () => {
       await this.flush();
+      if (this._exitHandler) {
+        process.removeListener('exit', this._exitHandler);
+        this._exitHandler = null;
+      }
       this._cache = null;
       this._closed = true;
     });

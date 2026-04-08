@@ -49,14 +49,66 @@ function deepMerge(target, source) {
   return result;
 }
 
+function isOperatorObject(obj) {
+  if (!isPlainObject(obj)) return false;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+  const hasOperator = keys.some(k => k.startsWith('$'));
+  const hasNonOperator = keys.some(k => !k.startsWith('$'));
+  if (hasOperator && hasNonOperator) {
+    throw new TypeError('Query predicate cannot mix operator keys ($...) with plain field keys');
+  }
+  return hasOperator;
+}
+
+function applyOperators(value, ops) {
+  for (const [op, operand] of Object.entries(ops)) {
+    switch (op) {
+      case '$eq':  if (value !== operand) return false; break;
+      case '$ne':  if (value === operand) return false; break;
+      case '$gt':  if (!(value > operand)) return false; break;
+      case '$gte': if (!(value >= operand)) return false; break;
+      case '$lt':  if (!(value < operand)) return false; break;
+      case '$lte': if (!(value <= operand)) return false; break;
+      case '$in':
+        if (!Array.isArray(operand)) throw new TypeError('$in operand must be an array');
+        if (!operand.some(v => v === value)) return false;
+        break;
+      case '$nin':
+        if (!Array.isArray(operand)) throw new TypeError('$nin operand must be an array');
+        if (operand.some(v => v === value)) return false;
+        break;
+      case '$exists':
+        if (operand ? value === undefined : value !== undefined) return false;
+        break;
+      default:
+        throw new TypeError(`Unknown query operator: ${op}`);
+    }
+  }
+  return true;
+}
+
 function deepMatch(record, predicate) {
   for (const key of Object.keys(predicate)) {
-    const pVal = predicate[key];
-    const rVal = record[key];
-    if (isPlainObject(pVal) && isPlainObject(rVal)) {
-      if (!deepMatch(rVal, pVal)) return false;
-    } else if (rVal !== pVal) {
-      return false;
+    if (key === '$and') {
+      if (!Array.isArray(predicate.$and)) throw new TypeError('$and operand must be an array');
+      if (!predicate.$and.every(p => deepMatch(record, p))) return false;
+    } else if (key === '$or') {
+      if (!Array.isArray(predicate.$or)) throw new TypeError('$or operand must be an array');
+      if (!predicate.$or.some(p => deepMatch(record, p))) return false;
+    } else if (key === '$not') {
+      if (!isPlainObject(predicate.$not)) throw new TypeError('$not operand must be a plain object');
+      if (deepMatch(record, predicate.$not)) return false;
+    } else {
+      const pVal = predicate[key];
+      const rVal = record[key];
+      if (isOperatorObject(pVal)) {
+        if (!applyOperators(rVal, pVal)) return false;
+      } else if (isPlainObject(pVal) && isPlainObject(rVal)) {
+        if (!deepMatch(rVal, pVal)) return false;
+      } else if (rVal !== pVal) {
+        return false;
+      }
     }
   }
   return true;
@@ -78,6 +130,9 @@ class RecordManager {
    * @returns {Function} unsubscribe
    */
   watch(entityName, callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError(`watch() callback must be a function, got ${typeof callback}`);
+    }
     if (!this._watchers.has(entityName)) {
       this._watchers.set(entityName, new Set());
     }
@@ -197,8 +252,16 @@ class RecordManager {
   }
 
   /**
-   * Filters records by a function predicate or a plain object (deep field equality).
-   * Object predicates support nested matching: { address: { city: 'Milano' } } works.
+   * Filters records by a function predicate or a plain object.
+   * Plain-object predicates support deep field equality and query operators.
+   *
+   * Comparison operators: $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists
+   * Logical operators (root-level): $and, $or, $not
+   *
+   * Examples:
+   *   findWhere('orders', { total: { $gt: 100 }, status: { $ne: 'cancelled' } })
+   *   findWhere('orders', { $or: [{ status: 'new' }, { status: 'pending' }] })
+   *   findWhere('orders', r => r.total > 100) // function predicate — unchanged
    *
    * @param {string} entityName
    * @param {Function|object} predicate

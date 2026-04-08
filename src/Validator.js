@@ -16,6 +16,10 @@ function isPlainObject(val) {
 
 function deepEqual(a, b) {
   if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
   if (!isPlainObject(a) || !isPlainObject(b)) return false;
   const aKeys = Object.keys(a);
   const bKeys = Object.keys(b);

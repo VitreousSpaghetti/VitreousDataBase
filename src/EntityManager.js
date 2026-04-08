@@ -52,13 +52,13 @@ class EntityManager {
       }
 
       // 4. values must be a non-empty array of unique strings
-      const values = config.values;
-      if (!Array.isArray(values) || values.length === 0) {
+      if (!Array.isArray(config.values) || config.values.length === 0) {
         throw new TypeError(`Entity "${name}" must have a non-empty "values" array`);
       }
-      if (new Set(values).size !== values.length) {
+      if (new Set(config.values).size !== config.values.length) {
         throw new TypeError(`Entity "${name}" has duplicate entries in "values"`);
       }
+      let values = [...config.values];
 
       // Validate that optional array fields are actually arrays (not strings, numbers, etc.)
       for (const [fieldName, val] of [
@@ -185,12 +185,6 @@ class EntityManager {
     });
   }
 
-  /**
-   * Deletes an entity and its records (if table type).
-   * Throws EntityInUseError if an object type is still referenced by a table.
-   *
-   * @param {string} name
-   */
   /**
    * Adds a new optional field to an entity's values list.
    *
@@ -319,6 +313,12 @@ class EntityManager {
     });
   }
 
+  /**
+   * Deletes an entity and its records (if table type).
+   * Throws EntityInUseError if an object type is still referenced by a table.
+   *
+   * @param {string} name
+   */
   async deleteEntity(name) {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
