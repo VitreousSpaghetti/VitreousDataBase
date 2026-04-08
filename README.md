@@ -531,7 +531,7 @@ The test suite includes:
 
 - **No referential integrity across table entities.** VitreousDataBase has no concept of foreign keys between table entities. Deleting a `customers` record leaves all `orders` records with a dangling `customerId` intact and undetectable. Cross-table consistency must be maintained by the application.
 
-- **JSON-only values.** All field values must be JSON-serializable. Values like `Date`, `RegExp`, `Map`, `Set`, and `undefined` are not rejected at insert time but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
+- **JSON-only values.** All field values must be JSON-serializable. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time with a `TypeError`. Other non-serializable types (`Date`, `RegExp`, `Map`, `Set`, `undefined`) are **not** rejected but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
 
 - **No composite `unique` constraints.** The `unique` field in the entity config applies per-field only. There is no way to declare that a *combination* of non-id fields must be unique (e.g. `categoryId + slug`). If you need composite uniqueness, include those fields in `id` (which enforces composite tuple uniqueness) or enforce the constraint in application code.
 
@@ -539,7 +539,7 @@ The test suite includes:
 
 - **`findWhere` predicate errors are not wrapped.** If the predicate function throws (e.g. accessing a property of `null`), the raw JavaScript error propagates uncaught — it is not wrapped in a `VitreousError`. Code that catches only `VitreousError` will not handle it.
 
-- **Entity names are not validated.** There is no check on name format. Empty strings, names containing spaces, and names that collide with JavaScript prototype properties (`constructor`, `__proto__`, `hasOwnProperty`) are accepted silently. Behavior with these names is undefined.
+- **Entity names are not validated.** There is no check on name format. Empty strings and names containing spaces are accepted silently. The name `__proto__` is handled safely (no prototype pollution), but other prototype property names (`constructor`, `hasOwnProperty`, `toString`, etc.) may produce undefined behavior and are not recommended.
 
 - **Full file load on every operation (non-eager mode).** In the default mode, each operation calls `fs.readFile` + `JSON.parse` on the entire database file. There is no pagination or streaming. For large datasets this becomes an O(n) memory allocation per operation. Use eager mode for read-heavy workloads on large files.
 
