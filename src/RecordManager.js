@@ -12,7 +12,7 @@ function isPlainObject(val) {
   return val !== null && typeof val === 'object' && !Array.isArray(val);
 }
 
-// Normalize -0 to 0 recursively across all top-level fields
+// Normalize -0 to 0 for top-level fields only (not recursive)
 function normalizeMinusZero(record) {
   const out = {};
   for (const [k, v] of Object.entries(record)) {
@@ -65,6 +65,34 @@ function deepMatch(record, predicate) {
 class RecordManager {
   constructor(db) {
     this._db = db;
+    this._watchers = new Map(); // Map<entityName, Set<callback>>
+  }
+
+  /**
+   * Subscribes to changes on an entity. Returns an unsubscribe function.
+   * Callback receives: { type: 'insert'|'update'|'delete', record, previous? }
+   * Callbacks that throw are silently ignored — they must not abort a write.
+   *
+   * @param {string} entityName
+   * @param {Function} callback
+   * @returns {Function} unsubscribe
+   */
+  watch(entityName, callback) {
+    if (!this._watchers.has(entityName)) {
+      this._watchers.set(entityName, new Set());
+    }
+    this._watchers.get(entityName).add(callback);
+    return () => {
+      this._watchers.get(entityName)?.delete(callback);
+    };
+  }
+
+  _emit(entityName, event) {
+    const fns = this._watchers.get(entityName);
+    if (!fns) return;
+    for (const fn of fns) {
+      try { fn(event); } catch (_) {}
+    }
   }
 
   _getTableConfig(data, entityName) {
@@ -97,7 +125,9 @@ class RecordManager {
       const clone = JSON.parse(JSON.stringify(record));
       data.entities[entityName].push(clone);
       await this._db._write(data);
-      return JSON.parse(JSON.stringify(clone));
+      const inserted = JSON.parse(JSON.stringify(clone));
+      this._emit(entityName, { type: 'insert', record: inserted });
+      return inserted;
     });
   }
 
@@ -225,6 +255,7 @@ class RecordManager {
       }
 
       const existingRecord = records[idx];
+      const previous = JSON.parse(JSON.stringify(existingRecord));
 
       // Deep merge: nested object fields are merged recursively instead of replaced
       const merged = normalizeMinusZero(deepMerge(existingRecord, updates));
@@ -233,7 +264,9 @@ class RecordManager {
 
       records[idx] = merged;
       await this._db._write(data);
-      return JSON.parse(JSON.stringify(merged));
+      const updated = JSON.parse(JSON.stringify(merged));
+      this._emit(entityName, { type: 'update', record: updated, previous });
+      return updated;
     });
   }
 
@@ -261,7 +294,9 @@ class RecordManager {
 
       const deleted = records.splice(idx, 1)[0];
       await this._db._write(data);
-      return JSON.parse(JSON.stringify(deleted));
+      const deletedClone = JSON.parse(JSON.stringify(deleted));
+      this._emit(entityName, { type: 'delete', record: deletedClone });
+      return deletedClone;
     });
   }
 }

@@ -183,4 +183,4 @@ function detectCircularReference(entityName, data, visited = new Set()) {
   }
 }
 
-module.exports = { validateRecord, validateNestedObject, detectCircularReference };
+module.exports = { validateRecord, validateNestedObject, detectCircularReference, deepEqual };

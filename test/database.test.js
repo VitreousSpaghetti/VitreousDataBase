@@ -94,4 +94,20 @@ describe('Database eager mode', () => {
       FileAccessError
     );
   });
+
+  // Regression: _registerExitHandler was not called when the file did not yet exist,
+  // leaving _cache as null and _dirty as false after the first write in eager mode.
+  test('eager mode on a new file: cache is populated and dirty flag is set after first write', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    // _cache must already be initialized after create() on a new file
+    assert.notEqual(db._cache, null);
+    await db.entityManager.createEntity('items', { type: 'table', values: ['id'], id: ['id'] });
+    assert.equal(db._dirty, true);
+    // disk must NOT have changed yet (eager mode)
+    const diskBefore = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    assert.equal(Object.keys(diskBefore.entitiesConfiguration).length, 0);
+    await db.flush();
+    const diskAfter = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    assert.ok(diskAfter.entitiesConfiguration.items);
+  });
 });

@@ -50,7 +50,13 @@ class Database {
     }
 
     if (!fileExists) {
-      await this._atomicWrite(JSON.parse(JSON.stringify(EMPTY_DB)));
+      const emptyData = JSON.parse(JSON.stringify(EMPTY_DB));
+      await this._atomicWrite(emptyData);
+      if (this._eager) {
+        this._cache = emptyData;
+        this._dirty = false;
+        this._registerExitHandler();
+      }
     } else {
       let raw;
       try {
@@ -133,6 +139,41 @@ class Database {
       try { await fsPromises.unlink(tempPath); } catch { /* ignore */ }
       throw new FileAccessError(this._filePath, `cannot write file: ${e.message}`);
     }
+  }
+
+  /**
+   * Runs multiple operations atomically. All operations share a forked in-memory
+   * snapshot; if any operation throws, no changes are persisted. On success, a
+   * single atomic write is performed.
+   *
+   * Watch callbacks registered on the real recordManager do NOT fire for
+   * operations inside a transaction. Nested transactions are not supported.
+   *
+   * @param {(tx: { entityManager: EntityManager, recordManager: RecordManager }) => Promise<void>} fn
+   */
+  async transaction(fn) {
+    return this._enqueue(async () => {
+      const data = await this._read();
+      let snapshot = JSON.parse(JSON.stringify(data));
+
+      const txDb = {
+        _closed: false,
+        _read:    async ()        => snapshot,
+        _write:   async (newData) => { snapshot = newData; },
+        _enqueue: (txFn)          => txFn(),
+      };
+
+      const EntityManager = require('./EntityManager');
+      const RecordManager = require('./RecordManager');
+      const tx = {
+        entityManager: new EntityManager(txDb),
+        recordManager: new RecordManager(txDb),
+      };
+
+      await fn(tx);
+
+      await this._write(snapshot);
+    });
   }
 
   async flush() {

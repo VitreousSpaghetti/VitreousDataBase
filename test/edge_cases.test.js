@@ -312,6 +312,43 @@ describe('EntityManager — deleteEntity on table with no records', () => {
 // RecordManager — clone isolation
 // ---------------------------------------------------------------------------
 
+// Regression: createEntity was returning finalConfig by reference.
+// In eager mode this meant the caller could corrupt the in-memory schema.
+describe('EntityManager — createEntity clone isolation', () => {
+  beforeEach(setup);
+  afterEach(cleanup);
+
+  test('mutating the config returned by createEntity does not affect the stored schema', async () => {
+    const config = await db.entityManager.createEntity('items', {
+      type: 'table', id: ['id'], values: ['id', 'name'],
+    });
+    config.values.push('INJECTED');
+    config.notnullable.push('INJECTED');
+
+    const stored = await db.entityManager.getEntity('items');
+    assert.ok(!stored.values.includes('INJECTED'));
+    assert.ok(!stored.notnullable.includes('INJECTED'));
+  });
+
+  test('mutating the config returned by createEntity in eager mode does not corrupt the cache', async () => {
+    const eagerDir = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'vitreousdb-clone-eager-'));
+    const eagerDb = await require('../index').Database.create(require('path').join(eagerDir, 'db.json'), { eager: true });
+    try {
+      const config = await eagerDb.entityManager.createEntity('items', {
+        type: 'table', id: ['id'], values: ['id', 'name'],
+      });
+      config.values.push('INJECTED');
+
+      // The cache must not have been corrupted
+      const stored = await eagerDb.entityManager.getEntity('items');
+      assert.ok(!stored.values.includes('INJECTED'));
+    } finally {
+      await eagerDb.close();
+      require('fs').rmSync(eagerDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('RecordManager — clone isolation', () => {
   beforeEach(setup);
   afterEach(cleanup);
@@ -431,9 +468,9 @@ describe('RecordManager — deleteRecord with composite id', () => {
   afterEach(cleanup);
 
   test('deletes the correct record by composite id', async () => {
-    // NOTE: because each id field is auto-added to unique individually,
-    // all id field values must be globally unique across all records.
-    // Composite tuple uniqueness is not supported — this is a known design limitation.
+    // Composite id uniqueness is enforced as a TUPLE (all id fields together),
+    // not per-field. Two records may share the value of an individual id field
+    // as long as the full combination is distinct.
     await db.entityManager.createEntity('lines', {
       type: 'table',
       id: ['orderId', 'lineId'],

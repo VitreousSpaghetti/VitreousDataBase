@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "test": "node --test test/validator.test.js test/database.test.js test/entity.test.js test/record.test.js"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "license": "MIT",
   "directories": {

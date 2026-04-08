@@ -7,8 +7,11 @@ const {
   EntityInUseError,
   InvalidIdError,
   UnknownFieldError,
+  NullConstraintError,
+  UniqueConstraintError,
+  InvalidMigrationError,
 } = require('./errors');
-const { detectCircularReference } = require('./Validator');
+const { detectCircularReference, deepEqual } = require('./Validator');
 
 class EntityManager {
   constructor(db) {
@@ -147,7 +150,7 @@ class EntityManager {
       });
       await this._db._write(data);
 
-      return finalConfig;
+      return JSON.parse(JSON.stringify(finalConfig));
     });
   }
 
@@ -188,6 +191,134 @@ class EntityManager {
    *
    * @param {string} name
    */
+  /**
+   * Adds a new optional field to an entity's values list.
+   *
+   * @param {string} entityName
+   * @param {string} fieldName
+   * @returns {object} updated config
+   */
+  async addField(entityName, fieldName) {
+    return this._db._enqueue(async () => {
+      const data = await this._db._read();
+      if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
+        throw new EntityNotFoundError(entityName);
+      }
+      const config = data.entitiesConfiguration[entityName];
+      if (config.values.includes(fieldName)) {
+        throw new InvalidMigrationError(entityName, `field "${fieldName}" already exists in values`);
+      }
+      config.values.push(fieldName);
+      await this._db._write(data);
+      return JSON.parse(JSON.stringify(config));
+    });
+  }
+
+  /**
+   * Removes a field from an entity and strips it from all existing records.
+   * Cannot remove id fields.
+   *
+   * @param {string} entityName
+   * @param {string} fieldName
+   */
+  async removeField(entityName, fieldName) {
+    return this._db._enqueue(async () => {
+      const data = await this._db._read();
+      if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
+        throw new EntityNotFoundError(entityName);
+      }
+      const config = data.entitiesConfiguration[entityName];
+      if (!config.values.includes(fieldName)) {
+        throw new InvalidMigrationError(entityName, `field "${fieldName}" not found in values`);
+      }
+      if (config.id.includes(fieldName)) {
+        throw new InvalidIdError(entityName, `cannot remove id field "${fieldName}"`);
+      }
+      config.values     = config.values.filter(f => f !== fieldName);
+      config.notnullable = config.notnullable.filter(f => f !== fieldName);
+      config.unique      = config.unique.filter(f => f !== fieldName);
+      config.nested      = config.nested.filter(f => f !== fieldName);
+      if (config.type === 'table' && Object.prototype.hasOwnProperty.call(data.entities, entityName)) {
+        for (const record of data.entities[entityName]) {
+          delete record[fieldName];
+        }
+      }
+      await this._db._write(data);
+    });
+  }
+
+  /**
+   * Adds a constraint ('notnullable' or 'unique') to the given fields of an entity.
+   * Performs a safety check against existing records before persisting.
+   *
+   * @param {string} entityName
+   * @param {'notnullable'|'unique'} constraint
+   * @param {string[]} fields
+   */
+  async addConstraint(entityName, constraint, fields) {
+    return this._db._enqueue(async () => {
+      const data = await this._db._read();
+      if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
+        throw new EntityNotFoundError(entityName);
+      }
+      const config = data.entitiesConfiguration[entityName];
+
+      if (constraint !== 'notnullable' && constraint !== 'unique') {
+        throw new InvalidMigrationError(entityName, `unknown constraint "${constraint}", must be "notnullable" or "unique"`);
+      }
+      if (constraint === 'unique' && config.type === 'object') {
+        throw new InvalidMigrationError(entityName, 'object entities cannot have unique constraints');
+      }
+
+      for (const field of fields) {
+        if (!config.values.includes(field)) {
+          throw new InvalidMigrationError(entityName, `field "${field}" not found in values`);
+        }
+      }
+
+      const records = Object.prototype.hasOwnProperty.call(data.entities, entityName)
+        ? data.entities[entityName]
+        : [];
+
+      if (constraint === 'notnullable') {
+        for (const field of fields) {
+          for (const record of records) {
+            if (record[field] === null || record[field] === undefined) {
+              throw new NullConstraintError(entityName, field);
+            }
+          }
+        }
+        for (const field of fields) {
+          if (!config.notnullable.includes(field)) config.notnullable.push(field);
+        }
+      }
+
+      if (constraint === 'unique') {
+        const isNested = config.nested || [];
+        for (const field of fields) {
+          for (let i = 0; i < records.length; i++) {
+            const val = records[i][field];
+            if (val === null || val === undefined) continue;
+            for (let j = i + 1; j < records.length; j++) {
+              const other = records[j][field];
+              const equal = isNested.includes(field)
+                ? deepEqual(val, other)
+                : Object.is(val, other);
+              if (equal) {
+                throw new UniqueConstraintError(entityName, field, val);
+              }
+            }
+          }
+        }
+        for (const field of fields) {
+          if (!config.unique.includes(field)) config.unique.push(field);
+        }
+      }
+
+      await this._db._write(data);
+    });
+  }
+
   async deleteEntity(name) {
     return this._db._enqueue(async () => {
       const data = await this._db._read();

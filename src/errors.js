@@ -117,6 +117,15 @@ class RecordNotFoundError extends VitreousError {
   }
 }
 
+class InvalidMigrationError extends VitreousError {
+  constructor(entityName, reason) {
+    super(`[${entityName}] invalid migration: ${reason}`);
+    this.name = 'InvalidMigrationError';
+    this.entityName = entityName;
+    this.reason = reason;
+  }
+}
+
 module.exports = {
   VitreousError,
   FileAccessError,
@@ -131,4 +140,5 @@ module.exports = {
   InvalidIdError,
   CircularReferenceError,
   RecordNotFoundError,
+  InvalidMigrationError,
 };
