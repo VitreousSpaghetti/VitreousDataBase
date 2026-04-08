@@ -1,14 +1,31 @@
 {
   "name": "vitreousdatabase",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A JSON-file-backed non-relational database module for Node.js",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/validator.test.js test/database.test.js test/entity.test.js test/record.test.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VitreousSpaghetti/VitreousDataBase.git"
+  },
+  "keywords": [
+    "nodejs",
+    "databse",
+    "databasenosql"
+  ],
+  "author": "vitreous",
+  "bugs": {
+    "url": "https://github.com/VitreousSpaghetti/VitreousDataBase/issues"
+  },
+  "homepage": "https://github.com/VitreousSpaghetti/VitreousDataBase#readme"
 }

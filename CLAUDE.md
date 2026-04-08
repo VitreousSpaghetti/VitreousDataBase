@@ -49,22 +49,24 @@ test/record.test.js       integration tests for RecordManager
 
 - `"table"` entities store records in `entities[name][]`
 - `"object"` entities are schema-only; they have no entry in `entities` and cannot be inserted directly
-- `nested` field names must each correspond to a registered `"object"` entity; name matching is by convention (field name === entity name)
+- `nested` field names must each correspond to a registered `"object"` entity; name matching is by convention (field name === entity name). This means two fields of the same type within one entity are not expressible — each field name must match a distinct `"object"` entity name.
 
 ---
 
 ## Invariants — never break these
 
 1. **`id` fields are immutable.** `RecordManager.update()` rejects any patch containing an id field. Do not relax this.
-2. **`id` fields auto-normalize.** `EntityManager.createEntity()` adds all `id` fields to both `notnullable` and `unique` before persisting. Any code path that modifies `id` must re-run this normalization.
+2. **`id` fields auto-normalize.** `EntityManager.createEntity()` adds all `id` fields to `values` (if absent) and `notnullable` before persisting. Uniqueness is enforced in `validateRecord` as a **composite tuple** (all id field values together), not per-field. Any code path that modifies `id` must ensure composite uniqueness is rechecked. Two records may share the value of an individual id field as long as the full combination differs.
 3. **`id` fields cannot be `nested`.** Validated at `createEntity` time. An id field must be a primitive-comparable value.
-4. **`object` entities have no `id`.** Enforced at `createEntity` time.
-5. **Unique constraint is skipped for `nested` fields.** Deep equality of objects is not supported. This is intentional, not a bug.
-6. **All writes go through `Database._write()`.** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
-7. **All reads go through `Database._read()`.** Same reason as above.
-8. **All operations are wrapped in `Database._enqueue()`.** This is the intra-process concurrency mutex. Every public method in EntityManager and RecordManager must call `this._db._enqueue(async () => { ... })` as its outermost wrapper.
-9. **Writes are atomic.** `Database._atomicWrite()` uses a temp file + `fs.rename`. Never replace this with a direct `fs.writeFile` to the target path.
-10. **Circular reference detection runs before persisting.** In `createEntity`, the new config is added to a snapshot first; `detectCircularReference` runs on the snapshot; only then is `_write` called.
+4. **`object` entities have no `id` and no `unique`.** Both are enforced at `createEntity` time. `unique` constraints are meaningless on object entities because `validateNestedObject` never applies them.
+5. **`table` entities must declare at least one `id` field.** Enforced at `createEntity` time. A table without `id` has no stable identity for `update`/`deleteRecord`.
+6. **Unique constraint is skipped for `nested` fields.** Deep equality of objects is not supported. This is intentional, not a bug.
+7. **All writes go through `Database._write()`.** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
+8. **All reads go through `Database._read()`.** Same reason as above.
+9. **All operations are wrapped in `Database._enqueue()`.** This is the intra-process concurrency mutex. Every public method in EntityManager and RecordManager must call `this._db._enqueue(async () => { ... })` as its outermost wrapper.
+10. **Writes are atomic.** `Database._atomicWrite()` uses a temp file + `fs.rename`. Never replace this with a direct `fs.writeFile` to the target path.
+11. **Circular reference detection runs before persisting.** In `createEntity`, the new config is added to a snapshot first; `detectCircularReference` runs on the snapshot; only then is `_write` called.
+12. **`idObject` passed to `findById`, `update`, and `deleteRecord` must contain ALL declared `id` fields, and every key must be a declared `id` field.** Throws `InvalidIdError` if any id field is missing or if a non-id key is present. Partial idObjects on composite-id entities are rejected to prevent silent wrong-record mutations.
 
 ---
 
@@ -78,12 +80,13 @@ Order of checks:
 1. Entity exists and is `type: 'table'`
 2. No unknown fields (not in `values`)
 3. All `notnullable` fields are non-null and non-undefined
-4. All `unique` fields (excluding those in `nested`) have no duplicate in existing records; in update mode, `existingRecord` is excluded from the comparison
-5. All `nested` fields present in the record are plain objects; each is recursively validated via `validateNestedObject`
+4. No field has a non-JSON-serializable number value (`NaN`, `Infinity`, `-Infinity`) — throws `TypeError`
+5. All `unique` fields (excluding those in `nested`) have no duplicate in existing records; uses `Object.is` for comparison; in update mode, `existingRecord` is excluded from the comparison. **Note:** the `Object.is(NaN, NaN)` path is currently unreachable because check 4 rejects `NaN` first — the `Object.is` comparison applies to other edge cases (e.g. `Object.is(-0, 0)` is false).
+6. All `nested` fields present in the record are plain objects; each is recursively validated via `validateNestedObject`
 
 ### `validateNestedObject(nestedEntityName, value, data)`
 
-Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, notnullable. No unique check. Recurses into further nested fields.
+Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, non-JSON-serializable numbers (NaN/Infinity/-Infinity), notnullable. No unique check. Recurses into further nested fields.
 
 ### `detectCircularReference(entityName, data, visited = new Set())`
 
@@ -104,16 +107,24 @@ DFS. Passes `new Set(visited)` per branch — this allows diamond dependencies (
 
 ```js
 this._queue = Promise.resolve();
-_enqueue(fn) { return (this._queue = this._queue.then(fn)); }
+_enqueue(fn) {
+  const next = this._queue.then(fn);
+  this._queue = next.catch(() => {});
+  return next;
+}
 ```
 
 All public operations are serialized through `_enqueue`. This prevents read-modify-write races within a single process.
 
+Each operation's failure is isolated: if an enqueued `fn` rejects, the rejection propagates to the caller via `next`, but `this._queue` is reset to a resolved promise via `.catch(() => {})`. Subsequent operations are therefore unaffected by a previous failure.
+
+> **Multi-process safety:** the mutex only covers a single process. Two concurrent processes can interleave their read-modify-write cycles regardless of mode. There is no cross-process file locking. Do not share a database file across processes without external coordination.
+
 ### Eager mode flush
 
 - `flush()` — writes cache to disk; no-op in non-eager mode
-- `close()` — calls `flush()` then sets `_closed = true`
-- `process.on('exit')` — emergency sync flush via `fs.writeFileSync` if `_dirty` is true
+- `close()` — enqueued via `_enqueue`, so it waits for all pending operations before flushing and setting `_closed = true`. Any subsequent `_read()` or `_write()` call throws `FileAccessError('database is closed')`. Calling `close()` a second time is a safe no-op — the `_closed` check returns early before flush.
+- `process.on('exit')` — emergency sync flush via `fs.writeFileSync` if `_dirty` is true. **Not triggered by `SIGKILL`, OOM, or unhandled `SIGTERM`** — callers should register their own signal handlers if they need guaranteed flush on unexpected shutdown.
 
 ### Atomic write
 
@@ -123,6 +134,8 @@ await fs.writeFile(tempPath, JSON.stringify(data, null, 2));
 await fs.rename(tempPath, filePath);
 // finally: unlink tempPath if rename throws
 ```
+
+> **Temp file orphans:** if the process crashes between `writeFile` and `rename`, the `.tmp` file is left on disk. The `finally` unlink only covers the case where `rename` throws — not a process crash. In environments with frequent crashes, `.tmp` files may accumulate in the database directory.
 
 ---
 
@@ -143,8 +156,16 @@ All in `src/errors.js`. All extend `VitreousError`. Each carries machine-readabl
 | `NestedTypeError` | `entityName`, `fieldName` |
 | `InvalidIdError` | `entityName`, `reason` |
 | `CircularReferenceError` | `entityName`, `cycle` (array) |
+| `RecordNotFoundError` | `entityName`, `idObject` |
 
 When adding a new error, extend `VitreousError`, export it from `errors.js`, and re-export it from `index.js`.
+
+---
+
+## Known design limitations
+
+- **One nested type per field name.** Because a nested field name must equal the `"object"` entity name, you cannot have two fields referencing the same structural type within one entity (e.g. `billingAddress` and `shippingAddress` both backed by `"address"`). Each must map to a separately named `"object"` entity.
+- **`update()` cannot remove keys from a nested object.** `deepMerge` can add or overwrite keys but not delete them. Setting a key to `null` leaves it present as `null`. The only workaround is to replace the entire nested field with a new object, or set the field itself to `null` (valid only if the field is not `notnullable`).
 
 ---
 
@@ -152,7 +173,8 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 
 - **All public methods are `async`** and return Promises, even when the underlying operation is synchronous.
 - **Records are always cloned** (via `JSON.parse(JSON.stringify(...))`) before being returned. Callers must not mutate returned objects and expect the change to persist.
-- **`data` snapshots are mutated in-place** inside `_enqueue` callbacks before being passed to `_write`. This is safe because the mutex prevents concurrent access.
+- **Entity configs returned by `getEntity` are also cloned.** Mutating the returned object has no effect on the stored schema.
+- **`data` snapshots are mutated in-place** inside `_enqueue` callbacks before being passed to `_write`. This is safe because the mutex prevents concurrent access. **Critical:** all validation must run before any in-place mutation; in eager mode `_read()` returns `this._cache` directly, so a mutation before a failed validation would corrupt the cache with no rollback.
 - **No logging.** The module throws errors — it never logs to stdout or stderr.
 - **No optional chaining on `config` fields** unless the field is genuinely optional. All fields set by `createEntity` normalization (`id`, `notnullable`, `unique`, `nested`) are always arrays, never undefined.
 
@@ -172,7 +194,18 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 ## Running tests
 
 ```bash
-node --test test/validator.test.js test/database.test.js test/entity.test.js test/record.test.js
+node --test test/*.test.js
 ```
 
-Expected: **63 tests, 0 failures**.
+Expected: **262 tests, 0 failures**.
+
+The test suite includes:
+- `test/validator.test.js` — unit tests for Validator.js
+- `test/database.test.js` — Database init and eager mode
+- `test/entity.test.js` — EntityManager integration
+- `test/record.test.js` — RecordManager integration
+- `test/bugs.test.js` — regression tests for all BUGS.md fixes
+- `test/edge_cases.test.js` — boundary and edge case coverage
+- `test/persistence.test.js` — persistence and error property checks
+- `test/integration.test.js` — end-to-end scenarios
+- `test/readme.test.js` — verifies README examples work correctly

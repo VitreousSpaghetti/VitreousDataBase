@@ -108,6 +108,15 @@ class CircularReferenceError extends VitreousError {
   }
 }
 
+class RecordNotFoundError extends VitreousError {
+  constructor(entityName, idObject) {
+    super(`No record found in entity "${entityName}" matching ${JSON.stringify(idObject)}`);
+    this.name = 'RecordNotFoundError';
+    this.entityName = entityName;
+    this.idObject = idObject;
+  }
+}
+
 module.exports = {
   VitreousError,
   FileAccessError,
@@ -121,4 +130,5 @@ module.exports = {
   NestedTypeError,
   InvalidIdError,
   CircularReferenceError,
+  RecordNotFoundError,
 };

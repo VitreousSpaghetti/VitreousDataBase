@@ -55,10 +55,30 @@ class EntityManager {
         throw new TypeError(`Entity "${name}" has duplicate entries in "values"`);
       }
 
-      const id = config.id ? [...config.id] : [];
-      const notnullable = config.notnullable ? [...config.notnullable] : [];
-      const unique = config.unique ? [...config.unique] : [];
-      const nested = config.nested ? [...config.nested] : [];
+      // Validate that optional array fields are actually arrays (not strings, numbers, etc.)
+      for (const [fieldName, val] of [
+        ['id', config.id],
+        ['notnullable', config.notnullable],
+        ['unique', config.unique],
+        ['nested', config.nested],
+      ]) {
+        if (val !== undefined && val !== null && !Array.isArray(val)) {
+          throw new TypeError(
+            `Entity "${name}": "${fieldName}" must be an array, got ${typeof val}`
+          );
+        }
+      }
+
+      // Deduplicate all arrays
+      const id = config.id ? [...new Set(config.id)] : [];
+      const notnullable = config.notnullable ? [...new Set(config.notnullable)] : [];
+      const unique = config.unique ? [...new Set(config.unique)] : [];
+      const nested = config.nested ? [...new Set(config.nested)] : [];
+
+      // Auto-add id fields to values if not already present (BUG-5)
+      for (const field of id) {
+        if (!values.includes(field)) values.push(field);
+      }
 
       const allArrays = { id, notnullable, unique, nested };
 
@@ -85,14 +105,29 @@ class EntityManager {
         throw new InvalidIdError(name, 'object entities cannot have an id');
       }
 
-      // 8. Normalize: id fields automatically added to notnullable and unique
+      // 7b. object entities cannot declare unique constraints (validateNestedObject never applies them)
+      if (type === 'object' && unique.length > 0) {
+        throw new TypeError(
+          `Entity "${name}" of type "object" cannot declare "unique" constraints`
+        );
+      }
+
+      // 8. table entities must declare at least one id field
+      if (type === 'table' && id.length === 0) {
+        throw new TypeError(`Entity "${name}" of type "table" must declare at least one id field`);
+      }
+
+      // Normalize: id fields automatically added to notnullable.
+      // Uniqueness for id fields is enforced as a COMPOSITE key in validateRecord,
+      // not as individual per-field unique constraints.
       for (const field of id) {
         if (!notnullable.includes(field)) notnullable.push(field);
-        if (!unique.includes(field)) unique.push(field);
       }
 
       // 9. For each nested field: verify corresponding entity exists with type 'object'
+      // Skip self-references — they will be caught by detectCircularReference in step 10
       for (const field of nested) {
+        if (field === name) continue;
         const nestedConfig = data.entitiesConfiguration[field];
         if (!nestedConfig) {
           throw new EntityNotFoundError(field);
@@ -127,7 +162,7 @@ class EntityManager {
       const data = await this._db._read();
       const config = data.entitiesConfiguration[name];
       if (!config) throw new EntityNotFoundError(name);
-      return config;
+      return JSON.parse(JSON.stringify(config));
     });
   }
 
@@ -161,7 +196,7 @@ class EntityManager {
 
       if (config.type === 'object') {
         const referencedBy = Object.entries(data.entitiesConfiguration)
-          .filter(([, cfg]) => cfg.type === 'table' && (cfg.nested || []).includes(name))
+          .filter(([n, cfg]) => n !== name && (cfg.nested || []).includes(name))
           .map(([n]) => n);
 
         if (referencedBy.length > 0) {

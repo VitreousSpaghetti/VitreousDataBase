@@ -4,8 +4,50 @@ const {
   EntityNotFoundError,
   EntityTypeError,
   InvalidIdError,
+  RecordNotFoundError,
 } = require('./errors');
 const { validateRecord } = require('./Validator');
+
+function isPlainObject(val) {
+  return val !== null && typeof val === 'object' && !Array.isArray(val);
+}
+
+// Normalize -0 to 0 recursively across all top-level fields
+function normalizeMinusZero(record) {
+  const out = {};
+  for (const [k, v] of Object.entries(record)) {
+    out[k] = (v === 0 && (1 / v) === -Infinity) ? 0 : v;
+  }
+  return out;
+}
+
+function validateFullIdObject(entityName, idObject, config) {
+  for (const key of Object.keys(idObject)) {
+    if (!config.id.includes(key)) {
+      throw new InvalidIdError(entityName, `field "${key}" is not an id field`);
+    }
+  }
+  for (const idField of config.id) {
+    if (!Object.prototype.hasOwnProperty.call(idObject, idField)) {
+      throw new InvalidIdError(
+        entityName,
+        `idObject is missing required id field "${idField}"`
+      );
+    }
+  }
+}
+
+function deepMerge(target, source) {
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    if (isPlainObject(source[key]) && isPlainObject(target[key])) {
+      result[key] = deepMerge(target[key], source[key]);
+    } else {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
 
 class RecordManager {
   constructor(db) {
@@ -26,10 +68,11 @@ class RecordManager {
    * @param {object} record
    * @returns {object} inserted record (clone)
    */
-  async insert(entityName, record) {
+  async insert(entityName, rawRecord) {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
       this._getTableConfig(data, entityName);
+      const record = normalizeMinusZero(rawRecord);
       validateRecord(entityName, record, data);
       if (!data.entities[entityName]) data.entities[entityName] = [];
       const clone = JSON.parse(JSON.stringify(record));
@@ -52,13 +95,9 @@ class RecordManager {
       const data = await this._db._read();
       const config = this._getTableConfig(data, entityName);
 
-      const idKeys = Object.keys(idObject);
-      for (const key of idKeys) {
-        if (!config.id.includes(key)) {
-          throw new InvalidIdError(entityName, `field "${key}" is not an id field`);
-        }
-      }
+      validateFullIdObject(entityName, idObject, config);
 
+      const idKeys = Object.keys(idObject);
       const records = data.entities[entityName] || [];
       const found = records.find(r =>
         idKeys.every(k => r[k] === idObject[k])
@@ -158,16 +197,20 @@ class RecordManager {
         }
       }
 
-      const records = data.entities[entityName] || [];
+      validateFullIdObject(entityName, idObject, config);
+
       const idKeys = Object.keys(idObject);
+      const records = data.entities[entityName] || [];
       const idx = records.findIndex(r => idKeys.every(k => r[k] === idObject[k]));
 
       if (idx === -1) {
-        throw new EntityNotFoundError(entityName);
+        throw new RecordNotFoundError(entityName, idObject);
       }
 
       const existingRecord = records[idx];
-      const merged = { ...existingRecord, ...updates };
+
+      // Deep merge: nested object fields are merged recursively instead of replaced
+      const merged = normalizeMinusZero(deepMerge(existingRecord, updates));
 
       validateRecord(entityName, merged, data, { isUpdate: true, existingRecord });
 
@@ -187,14 +230,16 @@ class RecordManager {
   async deleteRecord(entityName, idObject) {
     return this._db._enqueue(async () => {
       const data = await this._db._read();
-      this._getTableConfig(data, entityName);
+      const config = this._getTableConfig(data, entityName);
 
-      const records = data.entities[entityName] || [];
+      validateFullIdObject(entityName, idObject, config);
+
       const idKeys = Object.keys(idObject);
+      const records = data.entities[entityName] || [];
       const idx = records.findIndex(r => idKeys.every(k => r[k] === idObject[k]));
 
       if (idx === -1) {
-        throw new EntityNotFoundError(entityName);
+        throw new RecordNotFoundError(entityName, idObject);
       }
 
       const deleted = records.splice(idx, 1)[0];

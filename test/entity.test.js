@@ -42,17 +42,18 @@ describe('createEntity', () => {
     assert.equal(config.type, 'table');
     assert.deepEqual(config.id, ['id']);
     assert.ok(config.notnullable.includes('id'));
-    assert.ok(config.unique.includes('id'));
+    // id fields are NOT added to unique individually (composite uniqueness via validateRecord)
+    assert.ok(!config.unique.includes('id'));
   });
 
-  test('auto-adds id fields to notnullable and unique', async () => {
+  test('auto-adds id fields to notnullable (not to unique individually)', async () => {
     const config = await db.entityManager.createEntity('products', {
       type: 'table',
       id: ['sku'],
       values: ['sku', 'name'],
     });
     assert.ok(config.notnullable.includes('sku'));
-    assert.ok(config.unique.includes('sku'));
+    assert.ok(!config.unique.includes('sku'));
   });
 
   test('creates an object entity successfully', async () => {
@@ -99,6 +100,7 @@ describe('createEntity', () => {
     await assert.rejects(
       () => db.entityManager.createEntity('orders', {
         type: 'table',
+        id: ['id'],
         values: ['id', 'address'],
         nested: ['address'],
       }),
@@ -111,6 +113,7 @@ describe('createEntity', () => {
     await assert.rejects(
       () => db.entityManager.createEntity('orders', {
         type: 'table',
+        id: ['id'],
         values: ['id', 'address'],
         nested: ['address'],
       }),
@@ -132,7 +135,8 @@ describe('createEntity', () => {
     await assert.rejects(
       () => db.entityManager.createEntity('nodeC', {
         type: 'table',
-        values: ['nodeB'],
+        id: ['id'],
+        values: ['id', 'nodeB'],
         nested: ['nodeB'],
       }),
       CircularReferenceError

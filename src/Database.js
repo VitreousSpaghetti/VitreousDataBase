@@ -87,8 +87,9 @@ class Database {
   }
 
   _enqueue(fn) {
-    this._queue = this._queue.then(fn);
-    return this._queue;
+    const next = this._queue.then(fn);
+    this._queue = next.catch(() => {});
+    return next;
   }
 
   async _read() {
@@ -143,9 +144,11 @@ class Database {
   }
 
   async close() {
-    await this.flush();
-    this._cache = null;
-    this._closed = true;
+    return this._enqueue(async () => {
+      await this.flush();
+      this._cache = null;
+      this._closed = true;
+    });
   }
 }
 

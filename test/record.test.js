@@ -9,6 +9,7 @@ const os = require('os');
 const {
   Database,
   EntityNotFoundError,
+  RecordNotFoundError,
   UnknownFieldError,
   NullConstraintError,
   UniqueConstraintError,
@@ -207,10 +208,10 @@ describe('update', () => {
     );
   });
 
-  test('throws EntityNotFoundError when record not found', async () => {
+  test('throws RecordNotFoundError when record not found', async () => {
     await assert.rejects(
       () => db.recordManager.update('users', { id: 999 }, { name: 'Ghost' }),
-      EntityNotFoundError
+      RecordNotFoundError
     );
   });
 
@@ -236,10 +237,10 @@ describe('deleteRecord', () => {
     assert.equal(all.length, 0);
   });
 
-  test('throws EntityNotFoundError when record not found', async () => {
+  test('throws RecordNotFoundError when record not found', async () => {
     await assert.rejects(
       () => db.recordManager.deleteRecord('users', { id: 999 }),
-      EntityNotFoundError
+      RecordNotFoundError
     );
   });
 });
