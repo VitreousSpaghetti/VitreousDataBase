@@ -181,6 +181,20 @@ describe('findWhere', () => {
     assert.equal(result[0].id, 2);
   });
 
+  test('filters by nested plain object predicate', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    await db.recordManager.insert('users', { id: 2, name: 'Bob', address: { street: 'Rue de Rivoli', city: 'Paris' } });
+    const result = await db.recordManager.findWhere('users', { address: { city: 'Milano' } });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].name, 'Alice');
+  });
+
+  test('nested predicate does not match partial object value', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    const result = await db.recordManager.findWhere('users', { address: { city: 'Roma' } });
+    assert.equal(result.length, 0);
+  });
+
   test('throws TypeError for invalid predicate', async () => {
     await assert.rejects(
       () => db.recordManager.findWhere('users', 'invalid'),
@@ -220,6 +234,60 @@ describe('update', () => {
     await db.recordManager.insert('users', { id: 2, name: 'Bob', email: 'b@x.com' });
     await assert.rejects(
       () => db.recordManager.update('users', { id: 2 }, { email: 'a@x.com' }),
+      UniqueConstraintError
+    );
+  });
+});
+
+describe('unique constraint on nested fields', () => {
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vitreousdb-unique-nested-'));
+    db = await Database.create(path.join(tmpDir, 'db.json'));
+
+    await db.entityManager.createEntity('address', {
+      type: 'object',
+      values: ['street', 'city'],
+      notnullable: ['city'],
+    });
+
+    await db.entityManager.createEntity('users', {
+      type: 'table',
+      id: ['id'],
+      values: ['id', 'name', 'address'],
+      notnullable: ['name'],
+      unique: ['address'],
+      nested: ['address'],
+    });
+  });
+  afterEach(cleanup);
+
+  test('allows two records with different nested values', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    const rec = await db.recordManager.insert('users', { id: 2, name: 'Bob', address: { street: 'Via Roma', city: 'Roma' } });
+    assert.equal(rec.id, 2);
+  });
+
+  test('throws UniqueConstraintError for duplicate nested value', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    await assert.rejects(
+      () => db.recordManager.insert('users', { id: 2, name: 'Bob', address: { street: 'Via Roma', city: 'Milano' } }),
+      UniqueConstraintError
+    );
+  });
+
+  test('deep equality is key-order independent', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    await assert.rejects(
+      () => db.recordManager.insert('users', { id: 2, name: 'Bob', address: { city: 'Milano', street: 'Via Roma' } }),
+      UniqueConstraintError
+    );
+  });
+
+  test('unique constraint on nested field respected on update', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice', address: { street: 'Via Roma', city: 'Milano' } });
+    await db.recordManager.insert('users', { id: 2, name: 'Bob', address: { street: 'Rue de Rivoli', city: 'Paris' } });
+    await assert.rejects(
+      () => db.recordManager.update('users', { id: 2 }, { address: { street: 'Via Roma', city: 'Milano' } }),
       UniqueConstraintError
     );
   });

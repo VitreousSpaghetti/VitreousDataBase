@@ -60,7 +60,7 @@ test/record.test.js       integration tests for RecordManager
 3. **`id` fields cannot be `nested`.** Validated at `createEntity` time. An id field must be a primitive-comparable value.
 4. **`object` entities have no `id` and no `unique`.** Both are enforced at `createEntity` time. `unique` constraints are meaningless on object entities because `validateNestedObject` never applies them.
 5. **`table` entities must declare at least one `id` field.** Enforced at `createEntity` time. A table without `id` has no stable identity for `update`/`deleteRecord`.
-6. **Unique constraint is skipped for `nested` fields.** Deep equality of objects is not supported. This is intentional, not a bug.
+6. **Unique constraint for `nested` fields uses deep equality.** Two nested objects are equal if they have the same keys and values recursively; key order does not matter.
 7. **All writes go through `Database._write()`.** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
 8. **All reads go through `Database._read()`.** Same reason as above.
 9. **All operations are wrapped in `Database._enqueue()`.** This is the intra-process concurrency mutex. Every public method in EntityManager and RecordManager must call `this._db._enqueue(async () => { ... })` as its outermost wrapper.
@@ -81,7 +81,7 @@ Order of checks:
 2. No unknown fields (not in `values`)
 3. All `notnullable` fields are non-null and non-undefined
 4. No field has a non-JSON-serializable number value (`NaN`, `Infinity`, `-Infinity`) — throws `TypeError`
-5. All `unique` fields (excluding those in `nested`) have no duplicate in existing records; uses `Object.is` for comparison; in update mode, `existingRecord` is excluded from the comparison. **Note:** the `Object.is(NaN, NaN)` path is currently unreachable because check 4 rejects `NaN` first — the `Object.is` comparison applies to other edge cases (e.g. `Object.is(-0, 0)` is false).
+5. All `unique` fields have no duplicate in existing records; nested fields use deep equality (`deepEqual`), primitives use `Object.is`; in update mode, `existingRecord` is excluded from the comparison
 6. All `nested` fields present in the record are plain objects; each is recursively validated via `validateNestedObject`
 
 ### `validateNestedObject(nestedEntityName, value, data)`

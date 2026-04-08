@@ -138,12 +138,20 @@ describe('validateRecord', () => {
     );
   });
 
-  test('unique skip for nested fields', () => {
-    // address is in nested — unique check must be skipped even if listed
+  test('throws UniqueConstraintError for duplicate nested field value', () => {
+    const data = makeData();
+    data.entitiesConfiguration.users.unique.push('address');
+    assert.throws(
+      () => validateRecord('users', { id: 2, name: 'Bob', address: { street: 'Via Roma', city: 'Milano' } }, data),
+      UniqueConstraintError
+    );
+  });
+
+  test('allows different nested field values even when unique is set', () => {
     const data = makeData();
     data.entitiesConfiguration.users.unique.push('address');
     assert.doesNotThrow(() =>
-      validateRecord('users', { id: 2, name: 'Bob', address: { street: 'Via Roma', city: 'Milano' } }, data)
+      validateRecord('users', { id: 2, name: 'Bob', address: { street: 'Via Garibaldi', city: 'Roma' } }, data)
     );
   });
 });

@@ -14,6 +14,15 @@ function isPlainObject(val) {
   return val !== null && typeof val === 'object' && !Array.isArray(val);
 }
 
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(k => deepEqual(a[k], b[k]));
+}
+
 /**
  * Validates a nested object value against its entity configuration.
  * No unique check at nested level — by design.
@@ -99,7 +108,7 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
     }
   }
 
-  // 3. unique checks
+  // 3. unique — nested fields use deep equality; primitives use strict equality
   const nested = config.nested || [];
   const existing = data.entities[entityName] || [];
 
@@ -118,10 +127,9 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
     }
   }
 
-  // 3b. Non-id unique fields (skip nested fields — deep equality not supported)
+  // 3b. Non-id unique fields — nested fields use deep equality; primitives use Object.is
   for (const field of (config.unique || [])) {
     if (idFields.includes(field)) continue; // already covered by composite id check (3a)
-    if (nested.includes(field)) continue;
     // null treated as "absent" for uniqueness — multiple records may have null on the same unique field
     if (record[field] === undefined || record[field] === null) continue;
 
@@ -129,8 +137,10 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
       ? existing.filter(r => r !== existingRecord)
       : existing;
 
+    const isNested = nested.includes(field);
     for (const r of compareTo) {
-      if (Object.is(r[field], record[field])) {
+      const equal = isNested ? deepEqual(r[field], record[field]) : Object.is(r[field], record[field]);
+      if (equal) {
         throw new UniqueConstraintError(entityName, field, record[field]);
       }
     }
