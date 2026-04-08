@@ -193,6 +193,8 @@ const line = await db.recordManager.findById('orderLines', { orderId: 101, lineI
 
 Returns the record, or `null` if not found.
 
+> **Note:** Comparison is strict (`===`). `findById('items', { id: '1' })` will not match a record with `id: 1` (number). The type of the value passed must match the type stored in the record.
+
 ### `findByIdSingle(entityName, value)`
 
 Convenience shorthand for entities with exactly one `id` field.
