@@ -59,7 +59,7 @@ test/record.test.js       integration tests for RecordManager
 2. **`id` fields auto-normalize.** `EntityManager.createEntity()` adds all `id` fields to both `notnullable` and `unique` before persisting. Any code path that modifies `id` must re-run this normalization.
 3. **`id` fields cannot be `nested`.** Validated at `createEntity` time. An id field must be a primitive-comparable value.
 4. **`object` entities have no `id`.** Enforced at `createEntity` time.
-5. **Unique constraint is skipped for `nested` fields.** Deep equality of objects is not supported. This is intentional, not a bug.
+5. **Unique constraint for `nested` fields uses deep equality.** Two nested objects are equal if they have the same keys and values recursively; key order does not matter.
 6. **All writes go through `Database._write()`.** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
 7. **All reads go through `Database._read()`.** Same reason as above.
 8. **All operations are wrapped in `Database._enqueue()`.** This is the intra-process concurrency mutex. Every public method in EntityManager and RecordManager must call `this._db._enqueue(async () => { ... })` as its outermost wrapper.
@@ -78,7 +78,7 @@ Order of checks:
 1. Entity exists and is `type: 'table'`
 2. No unknown fields (not in `values`)
 3. All `notnullable` fields are non-null and non-undefined
-4. All `unique` fields (excluding those in `nested`) have no duplicate in existing records; in update mode, `existingRecord` is excluded from the comparison
+4. All `unique` fields have no duplicate in existing records; nested fields use deep equality, primitives use `===`; in update mode, `existingRecord` is excluded from the comparison
 5. All `nested` fields present in the record are plain objects; each is recursively validated via `validateNestedObject`
 
 ### `validateNestedObject(nestedEntityName, value, data)`

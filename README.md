@@ -222,11 +222,10 @@ Filters records. Accepts either a **function** or a **plain object**.
 const rich = await db.recordManager.findWhere('customers', r => r.total > 1000);
 const milanese = await db.recordManager.findWhere('customers', r => r.address.city === 'Milano');
 
-// Plain object — top-level strict equality only
+// Plain object — deep equality, supports nested fields
 const alices = await db.recordManager.findWhere('customers', { name: 'Alice' });
+const milanese = await db.recordManager.findWhere('customers', { address: { city: 'Milano' } });
 ```
-
-> Nested field matching (e.g. `{ address: { city: 'Milano' } }`) is not supported via plain object — use a function predicate instead.
 
 ### `update(entityName, idObject, updates)`
 
@@ -278,7 +277,7 @@ await db.recordManager.insert('stores', {
 
 Nested objects:
 - Are validated for unknown fields and `notnullable` constraints.
-- Are **not** subject to `unique` checks (deep equality is not supported).
+- Are subject to `unique` checks using deep equality (key order does not matter).
 - Cannot be used as `id` fields.
 - Can themselves contain further nested objects (multi-level nesting is supported).
 

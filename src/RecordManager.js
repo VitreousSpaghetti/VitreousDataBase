@@ -7,6 +7,23 @@ const {
 } = require('./errors');
 const { validateRecord } = require('./Validator');
 
+function isPlainObject(val) {
+  return val !== null && typeof val === 'object' && !Array.isArray(val);
+}
+
+function deepMatch(record, predicate) {
+  for (const key of Object.keys(predicate)) {
+    const pVal = predicate[key];
+    const rVal = record[key];
+    if (isPlainObject(pVal) && isPlainObject(rVal)) {
+      if (!deepMatch(rVal, pVal)) return false;
+    } else if (rVal !== pVal) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class RecordManager {
   constructor(db) {
     this._db = db;
@@ -109,9 +126,8 @@ class RecordManager {
   }
 
   /**
-   * Filters records by a function predicate or a plain object (field equality).
-   * Note: object predicate only matches on top-level fields with strict equality.
-   * For nested field matching, use a function predicate.
+   * Filters records by a function predicate or a plain object (deep field equality).
+   * Object predicates support nested matching: { address: { city: 'Milano' } } works.
    *
    * @param {string} entityName
    * @param {Function|object} predicate
@@ -127,8 +143,7 @@ class RecordManager {
       if (typeof predicate === 'function') {
         matchFn = predicate;
       } else if (predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)) {
-        const keys = Object.keys(predicate);
-        matchFn = r => keys.every(k => r[k] === predicate[k]);
+        matchFn = r => deepMatch(r, predicate);
       } else {
         throw new TypeError('predicate must be a function or a plain object');
       }
