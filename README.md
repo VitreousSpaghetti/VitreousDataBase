@@ -1,5 +1,9 @@
 # VitreousDataBase
 
+[![npm version](https://img.shields.io/npm/v/vitreousdatabase.svg)](https://www.npmjs.com/package/vitreousdatabase)
+[![npm downloads](https://img.shields.io/npm/dm/vitreousdatabase.svg)](https://www.npmjs.com/package/vitreousdatabase)
+[![license](https://img.shields.io/npm/l/vitreousdatabase.svg)](LICENSE)
+
 A lightweight, file-backed non-relational database for Node.js. No external dependencies — data is stored as a JSON file on disk, with schema validation, constraints, and nested object support built in.
 
 ---
