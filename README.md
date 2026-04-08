@@ -20,7 +20,7 @@ Copy the module into your project or install it locally:
 
 ```bash
 # from a local path
-npm install ./path/to/VitreousDataBase
+npm install vitreousdatabase
 ```
 
 Then require it:
