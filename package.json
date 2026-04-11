@@ -1,6 +1,6 @@
 {
   "name": "vitreousdatabase",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "A JSON-file-backed non-relational database module for Node.js",
   "main": "index.js",
   "type": "commonjs",
