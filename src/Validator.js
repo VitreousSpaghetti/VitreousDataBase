@@ -167,6 +167,12 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
  * Detects circular nested references via DFS.
  * Uses a copy of `visited` per branch to allow diamond shapes but catch true cycles.
  *
+ * For subdatabase/sharded entities, the scan also descends into subEntities
+ * children and walks their own `nested` references. Children of v1 containers
+ * are always table/object, whose nested refs resolve to top-level object
+ * entities in `data.entitiesConfiguration` — so the walk can rejoin the
+ * existing top-level cycle check without special-casing.
+ *
  * @param {string} entityName
  * @param {object} data  full DB snapshot (with the new entity already tentatively added)
  * @param {Set<string>} visited
@@ -178,12 +184,23 @@ function detectCircularReference(entityName, data, visited = new Set()) {
   }
 
   const config = data.entitiesConfiguration[entityName];
-  if (!config || !config.nested || config.nested.length === 0) return;
+  if (!config) return;
 
-  for (const nestedField of config.nested) {
-    const branchVisited = new Set(visited);
-    branchVisited.add(entityName);
-    detectCircularReference(nestedField, data, branchVisited);
+  const nextVisited = new Set(visited);
+  nextVisited.add(entityName);
+
+  for (const nestedField of (config.nested || [])) {
+    detectCircularReference(nestedField, data, new Set(nextVisited));
+  }
+
+  // Also walk subEntities children: each child's nested refs may point at
+  // top-level object entities that, transitively, reach back into a cycle.
+  if (config.subEntities) {
+    for (const child of Object.values(config.subEntities)) {
+      for (const nestedField of (child.nested || [])) {
+        detectCircularReference(nestedField, data, new Set(nextVisited));
+      }
+    }
   }
 }
 

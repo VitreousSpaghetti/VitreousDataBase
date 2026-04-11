@@ -126,6 +126,15 @@ class InvalidMigrationError extends VitreousError {
   }
 }
 
+class ShardKeyError extends VitreousError {
+  constructor(entityName, reason) {
+    super(`Shard key error on entity "${entityName}": ${reason}`);
+    this.name = 'ShardKeyError';
+    this.entityName = entityName;
+    this.reason = reason;
+  }
+}
+
 module.exports = {
   VitreousError,
   FileAccessError,
@@ -141,4 +150,5 @@ module.exports = {
   CircularReferenceError,
   RecordNotFoundError,
   InvalidMigrationError,
+  ShardKeyError,
 };

@@ -592,3 +592,245 @@ describe('BUG-01 settima tornata — valori non-finiti in nested objects', () =>
     assert.equal(rec.coords.lat, 45.46);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUG — stale _idIndex dopo db.transaction() (eager mode)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Prima del fix: transaction() scriveva il nuovo snapshot con this._write() ma
+// non invalidava this._idIndex. Gli indici nella mappa puntavano ancora alle
+// posizioni del vecchio array, così:
+//   - findById di un record aggiunto dalla tx → RecordNotFoundError
+//   - findById di un record cancellato dalla tx → restituiva (tramite indice
+//     stale) un record sbagliato, non null.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('BUG — _idIndex stale dopo transaction (eager mode)', () => {
+  let tmpDir, dbPath;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vitreousdb-txidx-'));
+    dbPath = path.join(tmpDir, 'db.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('findById di un record inserito in tx trova il record', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    await db.entityManager.createEntity('users', {
+      type: 'table', values: ['id', 'name'], id: ['id'],
+    });
+    await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+    // Popola l'indice sullo scope "table/users"
+    await db.recordManager.findById('users', { id: 1 });
+
+    await db.transaction(async tx => {
+      await tx.recordManager.insert('users', { id: 2, name: 'Bob' });
+    });
+
+    const bob = await db.recordManager.findById('users', { id: 2 });
+    assert.ok(bob, 'record inserito in tx deve essere trovato');
+    assert.equal(bob.name, 'Bob');
+    await db.close();
+  });
+
+  test('findById di un record cancellato in tx restituisce null (no wrong-row read)', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    await db.entityManager.createEntity('users', {
+      type: 'table', values: ['id', 'name'], id: ['id'],
+    });
+    await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+    await db.recordManager.insert('users', { id: 2, name: 'Bob' });
+    // Popola l'indice
+    await db.recordManager.findById('users', { id: 1 });
+
+    await db.transaction(async tx => {
+      await tx.recordManager.deleteRecord('users', { id: 1 });
+    });
+
+    const gone = await db.recordManager.findById('users', { id: 1 });
+    assert.equal(gone, null, 'record cancellato non deve essere trovato');
+
+    const bob = await db.recordManager.findById('users', { id: 2 });
+    assert.ok(bob, 'record rimasto deve essere ancora trovabile');
+    assert.equal(bob.name, 'Bob');
+    await db.close();
+  });
+
+  test('delete+insert dentro la stessa tx non restituisce read incrociati', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    await db.entityManager.createEntity('users', {
+      type: 'table', values: ['id', 'name'], id: ['id'],
+    });
+    await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+    await db.recordManager.findById('users', { id: 1 }); // popola indice
+
+    await db.transaction(async tx => {
+      await tx.recordManager.deleteRecord('users', { id: 1 });
+      await tx.recordManager.insert('users', { id: 2, name: 'Bob' });
+    });
+
+    // Il vecchio indice mappava id 1 -> posizione 0. Senza il fix,
+    // findById({id:1}) avrebbe ritornato il record alla posizione 0,
+    // che ora è Bob, restituendo un wrong-row read.
+    const stale = await db.recordManager.findById('users', { id: 1 });
+    assert.equal(stale, null);
+    const bob = await db.recordManager.findById('users', { id: 2 });
+    assert.equal(bob.name, 'Bob');
+    await db.close();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUG — stale _idIndex dopo deleteEntity + createEntity con stesso nome
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Prima del fix: deleteEntity('x') non toccava this._idIndex. Dopo
+// createEntity('x', ...) con schema diverso, lo scope "table/x" riutilizzava
+// la mappa vecchia, che conteneva chiavi dello schema precedente oppure
+// indici riferiti all'array cancellato.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('BUG — _idIndex stale dopo deleteEntity (eager mode)', () => {
+  let tmpDir, dbPath;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vitreousdb-delidx-'));
+    dbPath = path.join(tmpDir, 'db.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('recreate + insert + findById funziona correttamente su table', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    await db.entityManager.createEntity('users', {
+      type: 'table', values: ['id', 'name'], id: ['id'],
+    });
+    await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+    await db.recordManager.insert('users', { id: 2, name: 'Bob' });
+    await db.recordManager.findById('users', { id: 1 }); // popola indice
+
+    await db.entityManager.deleteEntity('users');
+    assert.equal(db._idIndex.has('table/users'), false, 'indice deve essere ripulito');
+
+    await db.entityManager.createEntity('users', {
+      type: 'table', values: ['id', 'name'], id: ['id'],
+    });
+    await db.recordManager.insert('users', { id: 1, name: 'Charlie' });
+
+    const found = await db.recordManager.findById('users', { id: 1 });
+    assert.ok(found);
+    assert.equal(found.name, 'Charlie');
+
+    // Il vecchio record id:2 non deve essere trovato nel nuovo scope
+    const bob = await db.recordManager.findById('users', { id: 2 });
+    assert.equal(bob, null);
+    await db.close();
+  });
+
+  test('recreate + insert + findById funziona correttamente su sharded', async () => {
+    const db = await Database.create(dbPath, { eager: true });
+    await db.entityManager.createEntity('countries', {
+      type: 'sharded', values: ['code', 'name'], id: ['code'], shardKey: ['code'],
+    });
+    await db.recordManager.insert('countries', { code: 'US', name: 'United States' });
+    await db.recordManager.findById('countries', { code: 'US' }); // popola indice
+    const hadShardedKeys = Array.from(db._idIndex.keys())
+      .some(k => k.startsWith('sharded/countries/'));
+    assert.ok(hadShardedKeys, 'precondizione: indice shard popolato');
+
+    await db.entityManager.deleteEntity('countries');
+    const stillHasShardedKeys = Array.from(db._idIndex.keys())
+      .some(k => k.startsWith('sharded/countries/'));
+    assert.equal(stillHasShardedKeys, false, 'indice shard deve essere ripulito');
+
+    await db.entityManager.createEntity('countries', {
+      type: 'sharded', values: ['code', 'name'], id: ['code'], shardKey: ['code'],
+    });
+    await db.recordManager.insert('countries', { code: 'US', name: 'Other USA' });
+    const us = await db.recordManager.findById('countries', { code: 'US' });
+    assert.equal(us.name, 'Other USA');
+    await db.close();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUG — config.shardKey.includes() senza guard difensivo
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Prima del fix: se un file DB era caricato (es. post edit manuale) con
+// type:'sharded' ma senza un array shardKey, removeField e addConstraint
+// lanciavano un TypeError nativo invece di un VitreousError.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('BUG — guard difensivo su config.shardKey corrotto', () => {
+  let tmpDir, dbPath;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vitreousdb-shardguard-'));
+    dbPath = path.join(tmpDir, 'db.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('removeField su sharded con shardKey assente non lancia TypeError nativo', async () => {
+    // Crea un file DB con uno schema sharded corrotto (shardKey mancante)
+    const corruptData = {
+      entitiesConfiguration: {
+        c: {
+          type: 'sharded',
+          values: ['code', 'name'],
+          id: ['code'],
+          notnullable: ['code'],
+          unique: [],
+          nested: [],
+          // shardKey: mancante intenzionalmente
+          subEntities: {},
+        },
+      },
+      entities: {},
+    };
+    fs.writeFileSync(dbPath, JSON.stringify(corruptData, null, 2));
+
+    const db = await Database.create(dbPath);
+    // removeField su campo non shardKey e non id → deve funzionare senza
+    // lanciare TypeError sulla proprietà mancante
+    await db.entityManager.removeField('c', 'name');
+    const cfg = await db.entityManager.getEntity('c');
+    assert.equal(cfg.values.includes('name'), false);
+    await db.close();
+  });
+
+  test('addConstraint unique su sharded con shardKey assente lancia ShardKeyError, non TypeError', async () => {
+    const { ShardKeyError } = require('../index');
+    const corruptData = {
+      entitiesConfiguration: {
+        c: {
+          type: 'sharded',
+          values: ['code', 'name'],
+          id: ['code'],
+          notnullable: ['code'],
+          unique: [],
+          nested: [],
+          // shardKey: mancante intenzionalmente
+          subEntities: {},
+        },
+      },
+      entities: {},
+    };
+    fs.writeFileSync(dbPath, JSON.stringify(corruptData, null, 2));
+
+    const db = await Database.create(dbPath);
+    await assert.rejects(
+      db.entityManager.addConstraint('c', 'unique', ['name']),
+      ShardKeyError
+    );
+    await db.close();
+  });
+});

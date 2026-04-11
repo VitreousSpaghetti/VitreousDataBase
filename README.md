@@ -95,21 +95,27 @@ All data is stored in a single JSON file:
 
 | Type | Description |
 |------|-------------|
-| `"table"` | A standalone collection of records. Supports insert, find, update, delete. |
-| `"object"` | A reusable nested structure. Cannot be inserted directly — used only as a field inside a `table` entity. |
+| `"table"` | A standalone collection of records in the main file. Supports insert, find, update, delete. |
+| `"object"` | A reusable nested structure. Cannot be inserted directly — used only as a field inside another entity. |
+| `"subdatabase"` | A scoped multi-record container stored in a **separate sidecar file**. Has its own `id` and `values`, and can declare child entities (`subEntities`) whose records live alongside it in the same file. Use for logically grouped records that should scale independently. |
+| `"sharded"` | A partitioned container: records are split across **one file per shardKey tuple**. Each shard file has its own records plus any child-entity records scoped to that shard. Use when a single entity grows too large for the main file, and queries can be partitioned by a key (e.g. users by country). |
 
 ### Entity configuration fields
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `type` | yes | `"table"` or `"object"` |
-| `values` | yes | All field names the entity is allowed to have |
-| `id` | yes (for `"table"`) | Field names that identify a record (for lookups). Auto-added to `notnullable`. Uniqueness is enforced as a **composite tuple**, not per-field. At least one required for table entities. |
-| `notnullable` | no | Fields that cannot be `null` or `undefined` when saving |
-| `unique` | no | Fields whose value must be unique across all records |
-| `nested` | no | Fields whose value is a nested object (must match a registered `"object"` entity) |
+| Field | Required for | Description |
+|-------|--------------|-------------|
+| `type` | all | `"table"`, `"object"`, `"subdatabase"`, or `"sharded"` |
+| `values` | all | All field names the entity is allowed to have |
+| `id` | `table`, `subdatabase`, `sharded` | Field names that identify a record. Auto-added to `notnullable`. Uniqueness is enforced as a **composite tuple**. At least one required. |
+| `notnullable` | optional | Fields that cannot be `null` or `undefined` when saving |
+| `unique` | `table`, `subdatabase`, `sharded` | Fields whose value must be unique. On `sharded`, every `unique` field **must** also be in `shardKey` (cross-shard uniqueness is not enforced). |
+| `nested` | optional | Fields whose value is a nested object (must match a registered `"object"` entity) |
+| `shardKey` | **required** for `sharded` | ≥1 field used to partition records across shard files. Must be a subset of `id` (so id lookups resolve a single shard). shardKey fields are auto-added to `notnullable`. |
+| `subEntities` | optional on `subdatabase`/`sharded` | Map of child entity configs (same shape as a top-level config). v1 children must be `table` or `object`. Child table records live **inside the same sidecar file** as the container. |
 
-> **Note:** `id` fields are immutable after insert — they cannot be changed via `update()`.
+> **Note:** `id` (and therefore `shardKey`) fields are immutable after insert — they cannot be changed via `update()`.
+
+> **Sidecar files.** `subdatabase` and `sharded` entities store their data in a sidecar directory next to the main file: `<dbfile>.vdb/`. A `subdatabase` becomes one file (`<name>.json`); a `sharded` entity becomes a directory (`<name>/`) containing a `manifest.json` plus one file per shard tuple. Legacy databases with only `table`/`object` entities are unchanged — no sidecar directory is created.
 
 ---
 
@@ -117,7 +123,7 @@ All data is stored in a single JSON file:
 
 ### `createEntity(name, config)`
 
-Registers a new entity. Object-type entities must be created **before** any table that references them in `nested`.
+Registers a new entity. Object-type entities must be created **before** any entity that references them in `nested`.
 
 ```js
 // Register the nested type first
@@ -137,6 +143,57 @@ await db.entityManager.createEntity('customers', {
   nested: ['address'],     // 'address' must already exist as type "object"
 });
 ```
+
+#### Subdatabase entity
+
+Registers a container that lives in its own sidecar file and can host child entities:
+
+```js
+await db.entityManager.createEntity('app', {
+  type: 'subdatabase',
+  values: ['name', 'version'],
+  id: ['name'],
+  subEntities: {
+    log: { type: 'table', values: ['id', 'entry'], id: ['id'] },
+  },
+});
+
+await db.recordManager.insert('app', { name: 'vdb', version: '1.0' });
+await db.recordManager.insert('app.log', { id: 1, entry: 'started' });
+// Both records live in <dbfile>.vdb/app.json
+```
+
+#### Sharded entity
+
+Registers a partitioned container. Records are split across one file per `shardKey` tuple:
+
+```js
+await db.entityManager.createEntity('countries', {
+  type: 'sharded',
+  values: ['code', 'name', 'continent'],
+  id: ['code'],
+  shardKey: ['code'],
+  subEntities: {
+    person: {
+      type: 'table',
+      values: ['personId', 'firstName'],
+      id: ['personId'],
+      unique: ['firstName'],   // shard-local uniqueness
+    },
+  },
+});
+
+await db.recordManager.insert('countries', { code: 'US', name: 'United States', continent: 'NA' });
+await db.recordManager.insert('countries', { code: 'IT', name: 'Italy',         continent: 'EU' });
+// Creates <dbfile>.vdb/countries/<shardFile>.json per country, plus manifest.json
+```
+
+Rules for `sharded`:
+- `shardKey` is required and must be non-empty.
+- `id ⊇ shardKey` — every shardKey field must also be in `id` (so id lookups can resolve a single shard).
+- `unique ⊆ shardKey` — every field declared `unique` must also be in `shardKey` (uniqueness is enforced shard-locally, not globally).
+- `shardKey` fields cannot be `nested` (they must be primitive-comparable).
+- `shardKey` fields are auto-added to `notnullable`.
 
 ### `getEntity(name)`
 
@@ -223,7 +280,21 @@ Returns `undefined`.
 
 ## CRUD operations
 
-### `insert(entityName, record)`
+Every CRUD method accepts either a plain entity name (`"users"`) or a **dotted path** (`"countries.person"`) to target a child of a `subdatabase` / `sharded` container.
+
+Sharded-child operations (e.g. `countries.person`) require a `scope` option carrying the **parent's `shardKey`** values:
+
+```js
+await db.recordManager.insert(
+  'countries.person',
+  { personId: 1, firstName: 'Alice' },
+  { scope: { code: 'US' } },   // scope = parent shardKey values → selects the shard file
+);
+```
+
+See [Subdatabase and sharded containers](#subdatabase-and-sharded-containers) below for a full walkthrough.
+
+### `insert(entityName, record, options?)`
 
 Inserts a new record. All validation rules are applied.
 
@@ -235,7 +306,10 @@ const order = await db.recordManager.insert('orders', {
 });
 ```
 
-### `findById(entityName, idObject)`
+- For a top-level **`sharded`** entity, the record itself must contain every `shardKey` field — the shard file is resolved from the record.
+- For a **sharded-child** path (`parent.child`), pass `{ scope: { <parentShardKeyField>: value, ... } }` — missing scope throws `ShardKeyError`.
+
+### `findById(entityName, idObject, options?)`
 
 Looks up a record using an id object. Works for both single and composite ids. Key order does not matter.
 
@@ -250,10 +324,14 @@ const line = await db.recordManager.findById('orderLines', { orderId: 101, lineI
 Returns the record, or `null` if not found. Throws `EntityTypeError` if called on an `"object"` entity.
 
 - `idObject` must contain **all** declared `id` fields — throws `InvalidIdError` if any are missing or if it contains a non-id key.
+- For a top-level **`sharded`** entity, `idObject` automatically carries shardKey values (since `id ⊇ shardKey`), so no `scope` is needed — the correct shard is resolved from the id. If no shard file has been created for that tuple yet, returns `null`.
+- For a **sharded-child** path, pass `{ scope: { <parentShardKeyField>: value } }`. Without scope, throws `ShardKeyError`.
 
 > **Note:** Lookup uses strict `===` comparison. `findById('items', { id: '1' })` will not match a record with `id: 1` (number). The type of the value passed must match the type stored in the record. Note that `NaN === NaN` is `false` in JavaScript, so `findById` with `{ id: NaN }` will never find a record even if one was inserted with `id: NaN`.
 
-### `findByIdSingle(entityName, value)`
+> **O(1) lookups in eager mode.** The first `findById` for a given scope (table, subdatabase, or single shard file) lazily builds an in-memory id index keyed by the composite id tuple. Subsequent lookups in the same scope are O(1). Inserts update the index incrementally; deletes invalidate the scope's index so the next lookup rebuilds it. The index lives only in eager mode and only in memory — it is never persisted.
+
+### `findByIdSingle(entityName, value, options?)`
 
 Convenience shorthand for entities with exactly one `id` field.
 
@@ -261,11 +339,11 @@ Convenience shorthand for entities with exactly one `id` field.
 const customer = await db.recordManager.findByIdSingle('customers', 1);
 ```
 
-Returns `null` if no record matches. Throws `InvalidIdError` if the entity has a composite id. Throws `EntityTypeError` if called on an `"object"` entity.
+Returns `null` if no record matches. Throws `InvalidIdError` if the entity has a composite id. Throws `EntityTypeError` if called on an `"object"` entity. Accepts `options.scope` for sharded-child entities (same semantics as `findById`).
 
 > **Note:** Same strict `===` comparison as `findById` — `findByIdSingle('users', '1')` will not match a record with `id: 1` (number).
 
-### `findAll(entityName)`
+### `findAll(entityName, options?)`
 
 Returns all records for an entity. Throws `EntityTypeError` if called on an `"object"` entity.
 
@@ -273,7 +351,10 @@ Returns all records for an entity. Throws `EntityTypeError` if called on an `"ob
 const allCustomers = await db.recordManager.findAll('customers');
 ```
 
-### `findWhere(entityName, predicate)`
+- For a **`sharded`** entity, `findAll` fans out across every registered shard file.
+- For a **sharded-child** path, `findAll` fans out across every parent shard by default. Pass `{ scope: { <parentShardKeyField>: value } }` to restrict to a single parent shard.
+
+### `findWhere(entityName, predicate, options?)`
 
 Filters records. Accepts a **function predicate**, a **plain object** (exact deep match), or a **plain object with query operators**.
 
@@ -351,8 +432,9 @@ Throws `EntityTypeError` if called on an `"object"` entity. Throws `TypeError` f
 
 > **`NaN` behaviour with operators:** comparison operators use `===` internally. Since `NaN !== NaN`, `{ field: { $eq: NaN } }` never matches. Use a function predicate with `Number.isNaN()` to match `NaN` values explicitly: `r => Number.isNaN(r.field)`.
 
+> **Automatic shard pruning.** For a top-level `sharded` entity with a plain-object predicate, if every `shardKey` field is pinned to a direct equality value (not an operator object), `findWhere` loads **only** the matching shard file instead of fanning out across all shards. Pruning is skipped if any shardKey field is absent, `null`/`undefined`, or wrapped in an operator. Function predicates never prune — use `options.scope` or an object predicate to get the fast path.
 
-### `update(entityName, idObject, updates)`
+### `update(entityName, idObject, updates, options?)`
 
 Deep-merges `updates` into the existing record. Returns the updated record.
 
@@ -380,8 +462,9 @@ await db.recordManager.update('customers', { id: 1 }, {
 - **Array fields are replaced entirely**, not merged element-by-element. Only plain objects are deep-merged recursively. `[1, 2, 3]` updated with `[4]` becomes `[4]`, not `[4, 2, 3]`.
 - **`null` and `undefined` values are exempt from uniqueness checks.** Multiple records may hold `null` for a field declared `unique` — `null` is treated as "absent" rather than a comparable value.
 - **`undefined` values in `updates` are dropped silently** after the JSON round-trip. If a field in `updates` is `undefined` and that field is `notnullable`, validation will throw `NullConstraintError`. If it is not `notnullable`, the field will disappear from the stored record. Use `null` to explicitly clear a nullable field.
+- For **sharded-child** paths, pass `{ scope: { <parentShardKeyField>: value } }`. Without scope, throws `ShardKeyError`. A wrong scope throws `RecordNotFoundError` (the record lives in a different shard).
 
-### `deleteRecord(entityName, idObject)`
+### `deleteRecord(entityName, idObject, options?)`
 
 Removes a record and returns it.
 
@@ -392,6 +475,145 @@ const removed = await db.recordManager.deleteRecord('customers', { id: 1 });
 - Throws `EntityTypeError` if called on an `"object"` entity.
 - `idObject` must contain **all** declared `id` fields — throws `InvalidIdError` if any are missing or if it contains a non-id key.
 - Throws `RecordNotFoundError` if no record matches `idObject`.
+- For **sharded-child** paths, pass `{ scope: { <parentShardKeyField>: value } }`. Without scope, throws `ShardKeyError`.
+
+---
+
+## Subdatabase and sharded containers
+
+`subdatabase` and `sharded` entities split data out of the main JSON file into a sidecar directory next to it. They address two different scaling problems:
+
+| Problem | Solution |
+|---------|----------|
+| A single entity grows large and slows every unrelated read/write | `subdatabase` — put it in its own file |
+| A single entity grows *so* large the file itself becomes a bottleneck, but queries partition cleanly by some key | `sharded` — split it across one file per shardKey tuple |
+
+Both can declare `subEntities` — child entities whose records live **inside the same sidecar file** as the container. Children are addressed with a dotted path (`"parent.child"`) in every RecordManager method.
+
+### File layout
+
+Given a main database at `./mydata.json`, container data lives in:
+
+```
+mydata.json                       # main file (regular table/object entities)
+mydata.json.vdb/                  # sidecar directory, created lazily
+  settings.json                   # subdatabase 'settings' (one file, multi-record)
+  countries/                      # sharded entity 'countries'
+    manifest.json                 # { version, shards: { jsonKey -> filename } }
+    code=US.json                  # one shard file per shardKey tuple
+    code=IT.json
+    ...
+```
+
+Each sidecar container file has the shape:
+
+```json
+{
+  "records":  [ /* the container's own records */ ],
+  "entities": { "<childName>": [ /* subEntity child records */ ] }
+}
+```
+
+Shard filenames are `<field1>=<enc1>__<field2>=<enc2>.json`. If the encoded name is too long or contains unsafe characters, VitreousDataBase falls back to `sha1-<hex16>.json` and records the mapping in `manifest.json`.
+
+### Subdatabase — single-file container
+
+```js
+await db.entityManager.createEntity('settings', {
+  type: 'subdatabase',
+  values: ['key', 'val'],
+  id: ['key'],
+});
+
+await db.recordManager.insert('settings', { key: 'theme', val: 'dark' });
+await db.recordManager.insert('settings', { key: 'lang',  val: 'en'   });
+
+const theme = await db.recordManager.findById('settings', { key: 'theme' });
+const all   = await db.recordManager.findAll('settings');
+```
+
+`subdatabase` behaves like a regular table except that its records live in `<dbfile>.vdb/<name>.json` instead of the main file. All validation rules (id, notnullable, unique, nested) apply normally, scoped to that one file.
+
+### Sharded — per-shardKey partitioning
+
+```js
+await db.entityManager.createEntity('countries', {
+  type: 'sharded',
+  values: ['code', 'name', 'continent'],
+  id: ['code'],
+  shardKey: ['code'],
+});
+
+// Shard file is resolved from the record itself (because the record carries shardKey)
+await db.recordManager.insert('countries', { code: 'US', name: 'United States', continent: 'NA' });
+await db.recordManager.insert('countries', { code: 'IT', name: 'Italy',         continent: 'EU' });
+
+// findById: single-shard lookup (id includes shardKey → correct file resolved directly)
+const us = await db.recordManager.findById('countries', { code: 'US' });
+
+// findAll: fans out across every registered shard
+const everything = await db.recordManager.findAll('countries');
+
+// findWhere: auto-prunes to one shard when the predicate pins every shardKey field
+const onlyUS = await db.recordManager.findWhere('countries', { code: 'US' });          // 1 file loaded
+const allNA  = await db.recordManager.findWhere('countries', { continent: 'NA' });     // fans out
+```
+
+### Child entities inside containers
+
+`subdatabase` and `sharded` can host child `table` entities via `subEntities`. Each child's records are stored **inside the same sidecar file** as its parent instance.
+
+```js
+await db.entityManager.createEntity('countries', {
+  type: 'sharded',
+  values: ['code', 'name'],
+  id: ['code'],
+  shardKey: ['code'],
+  subEntities: {
+    person: {
+      type: 'table',
+      values: ['personId', 'firstName'],
+      id: ['personId'],
+      unique: ['firstName'],
+    },
+  },
+});
+
+await db.recordManager.insert('countries', { code: 'US', name: 'United States' });
+await db.recordManager.insert('countries', { code: 'IT', name: 'Italy' });
+
+// Sharded-child inserts REQUIRE options.scope carrying the parent shardKey values
+await db.recordManager.insert(
+  'countries.person',
+  { personId: 1, firstName: 'Alice' },
+  { scope: { code: 'US' } },
+);
+await db.recordManager.insert(
+  'countries.person',
+  { personId: 1, firstName: 'Alice' },  // same id AND same firstName allowed in a different shard
+  { scope: { code: 'IT' } },
+);
+
+// Scoped queries touch only one shard file:
+const usOnly = await db.recordManager.findAll('countries.person', { scope: { code: 'US' } });
+
+// Unscoped queries fan out across every shard:
+const allPeople = await db.recordManager.findAll('countries.person');
+```
+
+**Rules for child entities:**
+
+- In v1, `subEntities` children must be `"table"` or `"object"`. Nested `subdatabase` / `sharded` are not supported yet.
+- A child `"table"`'s `nested` refs must point at **top-level** `"object"` entities (not sibling children).
+- Uniqueness constraints on a sharded-child are **shard-local**: the same field value may exist in two different parent shards without conflict. Cross-shard uniqueness is not enforced.
+- `subdatabase-child` ops never need `scope` (there is only one sidecar file per subdatabase). `sharded-child` insert/update/delete/findById **require** `scope`; findAll/findWhere fan out when `scope` is omitted.
+
+### Limitations
+
+- **Transactions do not support sidecar ops.** `db.transaction()` operates on the main-file snapshot only. Calling any sub/sharded record operation inside a transaction throws `ShardKeyError`. Combine a transaction with separate post-transaction sidecar ops if you need to mix them.
+- **Watch events fire on the dotted path.** Subscribe with `watch('countries.person', cb)` to receive child-entity events.
+- **Cross-shard uniqueness is not enforced.** If you need global uniqueness on a sharded entity, include the constraint field in `shardKey` (so each shard contains at most one matching value).
+- **Multi-process access is not safe** for sidecar files, exactly like the main file. Use a single process per database.
 
 ---
 
