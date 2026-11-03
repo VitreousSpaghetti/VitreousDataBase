@@ -53,7 +53,7 @@ function validateNestedObject(nestedEntityName, value, data, _visited = new Set(
 
   // Reject non-JSON-serializable number values (same check as validateRecord)
   for (const [key, val] of Object.entries(value)) {
-    if (typeof val === 'number' && !isFinite(val)) {
+    if ((typeof val === 'number' && !isFinite(val)) || typeof val === 'bigint') {
       throw new TypeError(
         `Field "${key}" of nested entity "${nestedEntityName}" has non-serializable value: ${val}`
       );
@@ -93,7 +93,7 @@ function validateRecord(entityName, record, data, { isUpdate = false, existingRe
 
   // 0. Reject non-JSON-serializable number values
   for (const [key, val] of Object.entries(record)) {
-    if (typeof val === 'number' && !isFinite(val)) {
+    if ((typeof val === 'number' && !isFinite(val)) || typeof val === 'bigint') {
       throw new TypeError(`Field "${key}" of entity "${entityName}" has non-serializable value: ${val}`);
     }
   }

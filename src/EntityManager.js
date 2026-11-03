@@ -321,6 +321,9 @@ class EntityManager {
    */
   async addField(entityName, fieldName) {
     return this._db._enqueue(async () => {
+      if (typeof fieldName !== 'string' || fieldName.length === 0) {
+        throw new TypeError('fieldName must be a non-empty string');
+      }
       const data = await this._db._read();
       if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
         throw new EntityNotFoundError(entityName);
@@ -344,6 +347,9 @@ class EntityManager {
    */
   async removeField(entityName, fieldName) {
     return this._db._enqueue(async () => {
+      if (typeof fieldName !== 'string' || fieldName.length === 0) {
+        throw new TypeError('fieldName must be a non-empty string');
+      }
       const data = await this._db._read();
       if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
         throw new EntityNotFoundError(entityName);
@@ -387,6 +393,9 @@ class EntityManager {
    */
   async addConstraint(entityName, constraint, fields) {
     return this._db._enqueue(async () => {
+      if (!Array.isArray(fields)) {
+        throw new TypeError('fields must be an array of field names');
+      }
       const data = await this._db._read();
       if (!Object.prototype.hasOwnProperty.call(data.entitiesConfiguration, entityName)) {
         throw new EntityNotFoundError(entityName);

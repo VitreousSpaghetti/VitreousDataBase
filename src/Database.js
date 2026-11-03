@@ -445,6 +445,9 @@ class Database {
     return this._enqueue(async () => {
       const data = await this._read();
       let snapshot = JSON.parse(JSON.stringify(data));
+      // Serialize tx ops so concurrent calls (Promise.all) cannot validate
+      // against the same pre-write snapshot.
+      let txQueue = Promise.resolve();
 
       const rejectSidecar = () => {
         throw new ShardKeyError(
@@ -456,7 +459,11 @@ class Database {
         _closed: false,
         _read:    async ()        => snapshot,
         _write:   async (newData) => { snapshot = newData; },
-        _enqueue: (txFn)          => txFn(),
+        _enqueue: (txFn) => {
+          const next = txQueue.then(txFn);
+          txQueue = next.catch(() => {});
+          return next;
+        },
         // Sidecar I/O is not available inside transactions. Any sub/sharded record
         // op routed through RecordManager will hit one of these and throw.
         _loadContainer:        async ()  => rejectSidecar(),
@@ -494,6 +501,7 @@ class Database {
   }
 
   async flush() {
+    if (this._closed) throw new FileAccessError(this._filePath, 'database is closed');
     if (!this._eager) return;
     if (this._cache !== null && this._dirty) {
       await this._atomicWrite(this._cache);
@@ -510,6 +518,7 @@ class Database {
 
   async close() {
     return this._enqueue(async () => {
+      if (this._closed) return;
       await this.flush();
       if (this._exitHandler) {
         process.removeListener('exit', this._exitHandler);

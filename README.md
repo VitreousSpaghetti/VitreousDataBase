@@ -10,7 +10,7 @@ A lightweight, file-backed non-relational database for Node.js. No external depe
 
 ## Requirements
 
-- Node.js >= 18.0.0
+- Node.js >= 22.0.0
 
 ---
 
@@ -653,6 +653,7 @@ await db.transaction(async (tx) => {
 - **Watch callbacks do not fire** for operations inside a transaction (see [Watch API](#watch-api)).
 - **Nested transactions are not supported** — calling `db.transaction()` inside `fn` deadlocks.
 - Transactions are serialized through the same mutex as all other operations — a transaction blocks subsequent operations until it commits or rolls back.
+- `tx.*` calls inside `fn` are also serialized, so `Promise.all` over several `tx` operations is safe: uniqueness is checked against each previous write.
 
 ---
 
@@ -697,7 +698,7 @@ unsubscribe();
 **Behaviour:**
 - `watch()` is **synchronous** — it returns the unsubscribe function immediately (not a Promise). It throws `TypeError` synchronously if `callback` is not a function.
 - Multiple watchers on the same entity are all called in registration order.
-- A watcher that **throws** is silently ignored. The write still completes and other watchers still fire.
+- A watcher that **throws** (or, if `async`, **rejects**) is silently ignored. The write still completes, other watchers still fire, and no unhandled rejection is raised.
 - Events fire only **after** the write succeeds. A failed operation (e.g. unique constraint violation) fires no event. Watchers can safely assume each event represents a committed change.
 - `unsubscribe()` is **idempotent** — calling it more than once is a safe no-op.
 - Watch is **intra-process only** — no event fires when another process modifies the file.
@@ -844,6 +845,7 @@ try {
 | `CircularReferenceError` | Nested chain forms a cycle (including self-reference) | `entityName`, `cycle` |
 | `RecordNotFoundError` | `update` or `deleteRecord` found no record matching `idObject` | `entityName`, `idObject` |
 | `InvalidMigrationError` | `addField`/`removeField`/`addConstraint` called with an invalid argument (field already exists, field not found, unknown constraint type, unique on object entity) | `entityName`, `reason` |
+| `ShardKeyError` | Invalid `shardKey` config; sharded-child op without required `scope`; sidecar op inside a transaction | `entityName`, `reason` |
 
 ---
 
@@ -958,8 +960,14 @@ The test suite includes:
 - `test/watch.test.js` — recordManager.watch() events and unsubscribe
 - `test/bugs.test.js` — regression tests for known bug fixes
 - `test/edge_cases.test.js` — boundary and edge case coverage
+- `test/query_operators.test.js` — findWhere query operators
 - `test/persistence.test.js` — persistence and error property checks
 - `test/integration.test.js` — end-to-end scenarios
+- `test/adversarial.test.js` — adversarial inputs and invariant enforcement
+- `test/subdatabase.test.js` — `subdatabase` containers
+- `test/sharded.test.js` — `sharded` containers
+- `test/shard_children.test.js` — child entities inside containers
+- `test/id_index.test.js` — eager-mode in-memory id index
 - `test/readme.test.js` — verifies README examples work correctly
 
 ---
@@ -970,7 +978,7 @@ The test suite includes:
 
 - **No referential integrity across table entities.** VitreousDataBase has no concept of foreign keys between table entities. Deleting a `customers` record leaves all `orders` records with a dangling `customerId` intact and undetectable. Cross-table consistency must be maintained by the application.
 
-- **JSON-only values.** All field values must be JSON-serializable. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time with a `TypeError`. `BigInt` values bypass validation and throw a raw `TypeError` from `JSON.stringify` inside `insert()` — not a `VitreousError`. Other non-serializable types (`Date`, `RegExp`, `Map`, `Set`, `undefined`) are **not** rejected but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
+- **JSON-only values.** All field values must be JSON-serializable. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time with a `TypeError`. `BigInt` values are rejected the same way. Other non-serializable types (`Date`, `RegExp`, `Map`, `Set`, `undefined`) are **not** rejected but are silently corrupted by the `JSON.parse(JSON.stringify(...))` round-trip: `Date` becomes an ISO string, `RegExp`/`Map`/`Set` become `{}`, and `undefined` fields are dropped. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, and arrays.
 
 - **No composite `unique` constraints.** The `unique` field in the entity config applies per-field only. There is no way to declare that a *combination* of non-id fields must be unique (e.g. `categoryId + slug`). If you need composite uniqueness, include those fields in `id` (which enforces composite tuple uniqueness) or enforce the constraint in application code.
 
@@ -994,15 +1002,13 @@ The test suite includes:
 
 - **`$exists: false` is unreliable after JSON round-trip.** `undefined` field values are dropped by `JSON.stringify`. After a round-trip, a field set to `undefined` is indistinguishable from a field that was never written. Use `$exists: true` reliably; avoid relying on `$exists: false` for runtime logic.
 
-- **`insert()` with a non-object `record` throws a raw `TypeError` or produces a corrupted record.** Passing `null` or `undefined` throws `TypeError: Cannot convert undefined or null to object`. Passing a string produces a record keyed by character indices (e.g. `{ '0': 'h', '1': 'i' }`), bypassing validation and corrupting the entity. Always pass a plain object.
 
-- **`flush()` on a closed database is a silent no-op, not an error.** After `db.close()`, calling `flush()` exits early without throwing — inconsistent with `_read()` and `_write()`, which both throw `FileAccessError('database is closed')`. Always use `db.close()` (which flushes internally) rather than calling `flush()` independently.
+- **`flush()` on a closed database throws `FileAccessError`.** Always use `db.close()` (which flushes internally) for the final write.
 
 - **`createEntity` does not validate that `values` elements are strings.** The array is verified as non-empty and duplicate-free, but individual elements are not type-checked. Passing `values: [1, null, {}]` is accepted silently; subsequent operations may misbehave because field-name comparisons use string equality.
 
 - **`$exists` operator accepts any truthy/falsy value, not only booleans.** `{ $exists: 1 }` behaves as `$exists: true`; `{ $exists: 0 }` behaves as `$exists: false`. No error is thrown for non-boolean operands.
 
-- **Nested entity lookup in `createEntity` step 9 does not use `hasOwnProperty`.** If a field in `nested` shares a name with an `Object.prototype` property (e.g. `'constructor'`), the lookup finds the prototype method rather than `undefined`, producing `EntityTypeError` instead of `EntityNotFoundError`. Avoid using `Object.prototype` property names as nested field names.
 
 - **Unknown query operators throw `TypeError`, not `VitreousError`.** Passing an unrecognised operator key (e.g. `{ qty: { $between: [1, 5] } }`) throws `new TypeError('Unknown query operator: ...')`. Code catching only `VitreousError` subclasses will not intercept this error.
 
@@ -1024,7 +1030,7 @@ The test suite includes:
 
 - **`$not` only accepts a plain object as its operand.** Passing a function or an operator object (e.g. `{ $not: { $gt: 5 } }`) throws `TypeError('$not operand must be a plain object')`. To negate a comparison, use `$ne`, `$nin`, or a function predicate.
 
-- **`addConstraint` does not validate that `fields` is an array.** Passing a string instead of an array (e.g. `addConstraint('users', 'notnullable', 'name')`) iterates over the string's individual characters, each of which will likely throw `InvalidMigrationError` for not being a known field name.
+- **Migration argument errors are `TypeError`, not `VitreousError`.** `addConstraint` with a non-array `fields`, and `addField`/`removeField` with an empty or non-string `fieldName`, throw `TypeError`.
 
 - **ID lookup uses `===`, not `Object.is()`.** `findById`, `findByIdSingle`, `update`, and `deleteRecord` match records using `===`. This means `-0` and `+0` are treated as the same id in lookups, even though `insert` uses `Object.is()` for uniqueness (treating them as distinct). Avoid using `-0` and `+0` as id values.
 
@@ -1038,4 +1044,3 @@ The test suite includes:
 
 - **`addConstraint('unique')` on an `id` field creates redundant and conflicting checks.** There is no guard preventing `addConstraint(entity, 'unique', ['idField'])` on a field already declared in `id`. The `id` declaration enforces composite-tuple uniqueness; adding `unique` on an individual id field introduces a stricter per-field check. For composite-id entities, two records may legitimately share one id field value (the full tuple is still unique), but the per-field `unique` constraint will reject the second insert even though the composite id is valid.
 
-- **`update()` with a non-object `updates` argument throws a raw `TypeError`.** No type-check is performed on `updates` before it is passed to `deepMerge`. Passing `null`, a number, or a boolean causes `Object.keys(updates)` to throw a native `TypeError` that is not wrapped in a `VitreousError`. Passing a string deep-merges on character indices, silently producing a corrupted record. Always pass a plain object as `updates`.

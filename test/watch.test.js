@@ -169,6 +169,20 @@ describe('watch — callback error isolation', () => {
     // The good watcher still received the event
     assert.equal(good.length, 1);
   });
+
+  test('a rejecting async callback does not cause an unhandled rejection', async () => {
+    const unhandled = [];
+    const onUnhandled = (err) => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      db.recordManager.watch('users', async () => { throw new Error('async boom'); });
+      await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(unhandled.length, 0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
 
 describe('watch — watching before entity has records', () => {

@@ -834,3 +834,62 @@ describe('BUG — guard difensivo su config.shardKey corrotto', () => {
     await db.close();
   });
 });
+
+// ─── falle chiuse il 2026-11-03 ───────────────────────────────────────────────
+
+describe('falle chiuse — transazioni, predicate, argomenti, flush', () => {
+  let db, tmpDir;
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vitreousdb-bugs-'));
+    db = await Database.create(path.join(tmpDir, 'db.json'), { eager: true });
+    await db.entityManager.createEntity('users', {
+      type: 'table', id: ['id'], values: ['id', 'name', 'email'], unique: ['email'],
+    });
+  });
+  afterEach(async () => teardown(db, tmpDir));
+
+  test('Promise.all dentro transaction() non bypassa il vincolo unique', async () => {
+    await assert.rejects(
+      db.transaction(async (tx) => {
+        await Promise.all([
+          tx.recordManager.insert('users', { id: 1, email: 'a@b.com' }),
+          tx.recordManager.insert('users', { id: 2, email: 'a@b.com' }),
+        ]);
+      }),
+      UniqueConstraintError
+    );
+    assert.equal((await db.recordManager.findAll('users')).length, 0);
+  });
+
+  test('findWhere con predicate che muta il record non corrompe la cache eager', async () => {
+    await db.recordManager.insert('users', { id: 1, name: 'Alice' });
+    await db.recordManager.findWhere('users', (r) => { r.name = 'mutato'; return true; });
+    const r = await db.recordManager.findByIdSingle('users', 1);
+    assert.equal(r.name, 'Alice');
+  });
+
+  test('addField/removeField con fieldName non stringa lanciano TypeError', async () => {
+    await assert.rejects(db.entityManager.addField('users', 42), TypeError);
+    await assert.rejects(db.entityManager.addField('users', ''), TypeError);
+    await assert.rejects(db.entityManager.removeField('users', null), TypeError);
+  });
+
+  test('addConstraint con fields non array lancia TypeError', async () => {
+    await assert.rejects(db.entityManager.addConstraint('users', 'notnullable', 'name'), TypeError);
+  });
+
+  test('BigInt nel record lancia TypeError in validazione e non scrive nulla', async () => {
+    await assert.rejects(
+      db.recordManager.insert('users', { id: 1, name: 10n }),
+      /non-serializable/
+    );
+    assert.equal((await db.recordManager.findAll('users')).length, 0);
+  });
+
+  test('flush() dopo close() lancia FileAccessError; close() ripetuto resta un no-op', async () => {
+    const { FileAccessError } = require('../index');
+    await db.close();
+    await assert.rejects(db.flush(), FileAccessError);
+    await assert.doesNotReject(db.close());
+  });
+});

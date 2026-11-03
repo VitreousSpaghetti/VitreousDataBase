@@ -16,7 +16,8 @@ A Node.js module (CommonJS, zero runtime dependencies) that uses a JSON file as 
 index.js                    public entry point — re-exports Database + all error classes
 src/errors.js               all custom error classes (extend VitreousError)
 src/Validator.js            pure validation functions — no side effects, no I/O
-src/Database.js             file I/O, eager mode, intra-process mutex, transaction()
+src/Database.js             file I/O, eager mode, intra-process mutex, transaction(),
+                            sidecar container files (subdatabase/sharded), shard manifests
 src/EntityManager.js        schema CRUD (createEntity, getEntity, listEntities, deleteEntity,
                             addField, removeField, addConstraint)
 src/RecordManager.js        data CRUD (insert, findById, findByIdSingle, findAll, findWhere,
@@ -34,6 +35,10 @@ test/query_operators.test.js integration tests for findWhere query operators ($e
 test/persistence.test.js    persistence and error property checks
 test/integration.test.js    end-to-end scenarios
 test/adversarial.test.js    adversarial inputs (prototype pollution, invalid schemas, etc.)
+test/subdatabase.test.js    integration tests for subdatabase containers
+test/sharded.test.js        integration tests for sharded containers
+test/shard_children.test.js integration tests for subEntities children (dotted paths, scope)
+test/id_index.test.js       eager-mode in-memory id index
 test/readme.test.js         verifies README examples work correctly
 ```
 
@@ -45,12 +50,14 @@ test/readme.test.js         verifies README examples work correctly
 {
   "entitiesConfiguration": {
     "entityName": {
-      "type": "table | object",
+      "type": "table | object | subdatabase | sharded",
       "id": ["fieldName"],
       "values": ["fieldName", ...],
       "notnullable": ["fieldName", ...],
       "unique": ["fieldName", ...],
-      "nested": ["fieldName", ...]
+      "nested": ["fieldName", ...],
+      "shardKey": ["fieldName", ...],          // sharded only
+      "subEntities": { "childName": { ... } } // subdatabase/sharded only
     }
   },
   "entities": {
@@ -60,18 +67,25 @@ test/readme.test.js         verifies README examples work correctly
 ```
 
 - `"table"` entities store records in `entities[name][]`
+- `"subdatabase"` entities store their records in a sidecar file `<dbfile>.vdb/<name>.json`, not in `entities`
+- `"sharded"` entities store records in `<dbfile>.vdb/<name>/`, one file per `shardKey` tuple, plus `manifest.json` (`{ version, shards: { jsonKey -> filename } }`). Shard filenames are `<field>=<enc>__...json`, falling back to `sha1-<hex16>.json` when too long/unsafe
+- Sidecar container files have the shape `{ "records": [...], "entities": { "<child>": [...] } }`; `subEntities` child records live in the same file as their parent container (or shard). Children are addressed by dotted path (`"parent.child"`)
 - `"object"` entities are schema-only; they have no entry in `entities` and cannot be inserted directly
 - `nested` field names must each correspond to a registered `"object"` entity; name matching is by convention (field name === entity name). This means two fields of the same type within one entity are not expressible — each field name must match a distinct `"object"` entity name.
 
 **Constraints by entity type:**
 
-| Field | `"table"` | `"object"` |
-|-------|-----------|------------|
-| `id` | required (≥1 field) | not allowed |
-| `values` | required | required |
-| `notnullable` | optional | optional |
-| `unique` | optional | not allowed |
-| `nested` | optional | optional |
+| Field | `"table"` | `"object"` | `"subdatabase"` | `"sharded"` |
+|-------|-----------|------------|-----------------|-------------|
+| `id` | required (≥1 field) | not allowed | required | required, must ⊇ `shardKey` |
+| `values` | required | required | required | required |
+| `notnullable` | optional | optional | optional | optional (`shardKey` auto-added) |
+| `unique` | optional | not allowed | optional | optional, must ⊆ `shardKey` |
+| `nested` | optional | optional | optional | optional (not on `shardKey` fields) |
+| `shardKey` | not allowed | not allowed | not allowed | required (≥1 field) |
+| `subEntities` | not allowed | not allowed | optional | optional |
+
+`subEntities` children must be `"table"` or `"object"` in v1 (no nested containers). A child table's `nested` refs must point at **top-level** `"object"` entities. Uniqueness on sharded entities and sharded children is **shard-local**; cross-shard uniqueness is never enforced.
 
 `"object"` entities without `id` or `unique` are validated only for structure (unknown fields, notnullable, nested type). Passing `id` or `unique` to an `"object"` entity throws at `createEntity` time.
 
@@ -85,8 +99,8 @@ test/readme.test.js         verifies README examples work correctly
 4. **`object` entities have no `id` and no `unique`.** Both are enforced at `createEntity` time. `unique` constraints are meaningless on object entities because `validateNestedObject` never applies them.
 5. **`table` entities must declare at least one `id` field.** Enforced at `createEntity` time. A table without `id` has no stable identity for `update`/`deleteRecord`.
 6. **Unique constraint for `nested` fields uses deep equality.** Two nested objects are equal if they have the same keys and values recursively; key order does not matter.
-7. **All writes go through `Database._write()`.** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
-8. **All reads go through `Database._read()`.** Same reason as above.
+7. **All writes go through `Database._write()` (main file) or `Database._writeContainer()` (sidecar files).** Never write to the file directly from EntityManager or RecordManager. This ensures the eager-mode cache and the mutex stay consistent.
+8. **All reads go through `Database._read()` (main file) or `Database._loadContainer()` (sidecar files).** Same reason as above.
 9. **All operations are wrapped in `Database._enqueue()`.** This is the intra-process concurrency mutex. Every public method in EntityManager and RecordManager must call `this._db._enqueue(async () => { ... })` as its outermost wrapper.
 10. **Writes are atomic.** `Database._atomicWrite()` uses a temp file + `fs.rename`. Never replace this with a direct `fs.writeFile` to the target path.
 11. **Circular reference detection runs before persisting.** In `createEntity`, the new config is added to a snapshot first; `detectCircularReference` runs on the snapshot; only then is `_write` called.
@@ -101,7 +115,7 @@ test/readme.test.js         verifies README examples work correctly
 ### `validateRecord(entityName, record, data, { isUpdate, existingRecord })`
 
 Order of checks (as implemented):
-0. No field has a non-JSON-serializable number value (`NaN`, `Infinity`, `-Infinity`) — throws `TypeError` **before any other check**
+0. No field has a non-JSON-serializable number value (`NaN`, `Infinity`, `-Infinity`) or a `BigInt` — throws `TypeError` **before any other check**
 1. Entity exists and is `type: 'table'`
 2. No unknown fields (not in `values`)
 3. All `notnullable` fields are non-null and non-undefined
@@ -112,7 +126,7 @@ Order of checks (as implemented):
 
 ### `validateNestedObject(nestedEntityName, value, data, _visited = new Set())`
 
-Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, non-JSON-serializable numbers (NaN/Infinity/-Infinity), notnullable. No unique check. Recurses into further nested fields. `_visited` is an internal parameter used to detect circular references **at validation time** — including during `insert` and `update`, not only at `createEntity`. Do not pass it from outside the function.
+Validates a nested plain object against its `"object"` entity config. Checks: unknown fields, non-JSON-serializable numbers (NaN/Infinity/-Infinity) and `BigInt`, notnullable. No unique check. Recurses into further nested fields. `_visited` is an internal parameter used to detect circular references **at validation time** — including during `insert` and `update`, not only at `createEntity`. Do not pass it from outside the function.
 
 ### `detectCircularReference(entityName, data, visited = new Set())`
 
@@ -161,19 +175,34 @@ Runs multiple EntityManager/RecordManager operations atomically. If `fn` throws,
 Implementation: `transaction` enqueues a single outer operation. Inside it, a deep-clone of the current snapshot is forked. A fake `txDb` proxy (`_read` → returns fork, `_write` → updates fork, `_enqueue` → calls `fn()` directly) is passed to fresh `EntityManager` and `RecordManager` instances. The `fn` callback receives `{ entityManager, recordManager }` bound to this fake db.
 
 ```js
-// txDb: no I/O, no queue — already inside outer _enqueue
+// txDb: no I/O; a local queue (txQueue) serializes ops issued concurrently inside fn
 const txDb = {
   _closed: false,
   _read:    async ()        => snapshot,
   _write:   async (newData) => { snapshot = newData; },
-  _enqueue: (txFn)          => txFn(),
+  _enqueue: (txFn)          => { const next = txQueue.then(txFn); txQueue = next.catch(() => {}); return next; },
 };
 ```
 
 **Key constraints:**
 - **Watch callbacks do NOT fire** for operations inside a transaction. The `tx.recordManager` is a separate instance with its own (empty) `_watchers` map. Watchers on the real `db.recordManager` are not notified.
 - **Nested transactions are not supported.** Calling `db.transaction()` inside a `tx` callback will deadlock the outer `_enqueue` queue.
+- **Ops inside `fn` are serialized** by a local `txQueue`, so `Promise.all` over `tx.*` calls cannot bypass uniqueness checks.
 - Works in both default and eager modes.
+- **Main file only.** Any subdatabase/sharded record operation inside a transaction throws `ShardKeyError`.
+
+### Sidecar containers
+
+- `_sidecarDir = filePath + '.vdb'`, created lazily on first container write. Legacy DBs with only `table`/`object` entities never get one.
+- `_loadContainer(absPath)` / `_writeContainer(absPath, payload)` are the sidecar equivalents of `_read`/`_write`. Both throw `FileAccessError` when closed. A missing container file reads as `{ records: [], entities: {} }`.
+- Non-eager: `_writeContainer` writes through via `_atomicWriteToPath` (same temp + rename scheme). Eager: payloads are cached in `_shardCache` (key = sidecar-relative path) and marked dirty; `flush()`/`close()`/exit handler persist them.
+- Shard manifests are cached in `_shardManifests`. `_resolveShardFile` maps a shardKey tuple to a filename and registers it in the manifest.
+- `deleteEntity` on a container removes its sidecar path (`_removeSidecarPath`, refuses paths outside `_sidecarDir`) and purges its id-index entries.
+- Sharded top-level ops resolve the shard from the record/idObject (id ⊇ shardKey). Sharded-child insert/update/delete/findById require `options.scope` with the parent shardKey values (`ShardKeyError` otherwise); findAll/findWhere fan out across shards without scope. findWhere on a top-level sharded entity prunes to one shard when a plain-object predicate pins every shardKey field.
+
+### Eager-mode id index
+
+`Database._idIndex` is a `Map<scopeKey, Map<idKey, rowIndex>>` used by `RecordManager._findIndexById` in eager mode only. Scope keys: `table/<name>`, `subdatabase/<name>[/<child>]`, `sharded/<name>/<shardfile>[/<child>]`. Built lazily on first lookup; insert appends; update needs nothing (ids are immutable); delete invalidates the whole scope; `deleteEntity` calls `_purgeIdIndexForEntity`. Any new code path that reorders or replaces a records array in eager mode **must** invalidate the matching scope.
 
 ### Eager mode cache initialization
 
@@ -186,7 +215,7 @@ After `create()` returns, `this._cache` is always non-null in eager mode. `_regi
 ### Eager mode flush
 
 - `flush()` — writes cache to disk; no-op in non-eager mode
-- `close()` — enqueued via `_enqueue`, so it waits for all pending operations before flushing and setting `_closed = true`. Any subsequent `_read()` or `_write()` call throws `FileAccessError('database is closed')`. Calling `close()` a second time is a safe no-op: the second call enqueues normally, but `flush()` exits early because `this._cache === null` (set to `null` by the first `close()`), so no write occurs and `_closed` is set again harmlessly. `close()` also removes the `process.on('exit')` listener registered by `_registerExitHandler`, preventing listener accumulation when multiple instances are created and closed in the same process.
+- `close()` — enqueued via `_enqueue`, so it waits for all pending operations before flushing and setting `_closed = true`. Any subsequent `_read()` or `_write()` call throws `FileAccessError('database is closed')`. Calling `close()` a second time is a safe no-op: the enqueued callback returns immediately when `_closed` is already `true`. `flush()` called directly after `close()` throws `FileAccessError('database is closed')`. `close()` also removes the `process.on('exit')` listener registered by `_registerExitHandler`, preventing listener accumulation when multiple instances are created and closed in the same process.
 - `process.on('exit')` — emergency sync flush via `fs.writeFileSync` if `_dirty` is true. **Not triggered by `SIGKILL`, OOM, or unhandled `SIGTERM`** — callers should register their own signal handlers if they need guaranteed flush on unexpected shutdown. If the sync write itself fails (disk full, permission denied, file lock on Windows), the error is **silently discarded** (`catch {}`) — the data loss is not observable by the application. Always prefer `db.close()` or `db.flush()` before intentional process exit to guarantee data is persisted.
 
 ### Atomic write
@@ -221,6 +250,7 @@ All in `src/errors.js`. All extend `VitreousError`. Each carries machine-readabl
 | `CircularReferenceError` | `entityName`, `cycle` (array) |
 | `RecordNotFoundError` | `entityName`, `idObject` |
 | `InvalidMigrationError` | `entityName`, `reason` |
+| `ShardKeyError` | `entityName`, `reason` |
 
 When adding a new error, extend `VitreousError`, export it from `errors.js`, and re-export it from `index.js`.
 
@@ -234,13 +264,12 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 - **`normalizeMinusZero()` is not recursive, and runs on the full merged record at update time.** `-0` is normalized to `0` for top-level record fields only. Nested object fields containing `-0` are not normalized. This means a nested field can store `-0`, which survives the JSON round-trip as `0` (JSON silently converts it), but the in-memory representation inside an _enqueue callback may transiently hold `-0` in nested objects. Additionally, `update()` applies `normalizeMinusZero(deepMerge(existingRecord, updates))` to the **entire merged record** — including fields that were not part of `updates`. A `-0` stored in a pre-existing top-level field that was not touched by the patch will be silently converted to `0` by the update operation.
 - **Entity name format is not validated.** `createEntity` requires the name to be a non-empty string — passing `''`, `null`, `undefined`, or a non-string throws `TypeError('Entity name must be a non-empty string')`. However, beyond this basic check, the format is unconstrained: names containing spaces and prototype property names such as `constructor`, `hasOwnProperty`, and `toString` are accepted silently. `__proto__` is handled safely (no prototype pollution via `defineProperty`), but other prototype names may produce undefined behavior. Avoid names that collide with `Object.prototype` properties.
 - **Non-JSON types are silently corrupted by the round-trip.** All returned records pass through `JSON.parse(JSON.stringify(...))`. Non-finite numbers (`NaN`, `Infinity`, `-Infinity`) are rejected at validation time. Other non-serializable types are **not** rejected but are corrupted: `Date` → ISO string, `RegExp`/`Map`/`Set` → `{}`, `undefined` fields → dropped entirely. Use only plain JSON types: strings, numbers, booleans, `null`, plain objects, arrays.
-- **`BigInt` values in records throw a raw `TypeError` from `JSON.stringify`, not a `VitreousError`.** The NaN/Infinity guard in `validateRecord` only checks `typeof val === 'number' && !isFinite(val)`. `BigInt` has a different `typeof` (`"bigint"`) and bypasses that check. The error surfaces at the `JSON.parse(JSON.stringify(record))` call in `insert()` rather than at validation time, and is not wrapped in a `VitreousError`. Code that catches only `VitreousError` will not intercept it.
 - **`findWhere` predicate errors are not wrapped.** If the predicate function throws (e.g. accessing a property of `null`), the raw JavaScript error propagates uncaught — it is not wrapped in a `VitreousError`. Code that catches only `VitreousError` will not handle it.
 - **`detectCircularReference` DFS is exponential on deep diamond schemas.** It creates a fresh visited-set copy per branch, allowing shared nodes to be revisited once per path. For schemas with many levels of diamond-shaped nested dependencies (A→B, A→C, B→D, C→D, …), work grows as O(2^n). In practice nested schemas are shallow; this is not a concern for typical usage.
 - **Full file load on every operation (non-eager mode).** Each operation calls `fs.readFile` + `JSON.parse` on the entire database file. There is no pagination or streaming. For large datasets this is O(n) memory per operation. Use eager mode for workloads on large files.
-- **`addField` and `removeField` do not validate `fieldName` type.** Unlike `createEntity`, which validates the entity name is a non-empty string, these methods do not check that `fieldName` is a valid string. Callers are responsible for passing valid field names.
+- **`addField` and `removeField` only check that `fieldName` is a non-empty string.** Anything else throws `TypeError('fieldName must be a non-empty string')` (not a `VitreousError`). The format of the name is otherwise unconstrained.
 - **`addConstraint` accepts an empty `fields` array.** Calling `addConstraint(entity, 'notnullable', [])` succeeds as a no-op write. No error is thrown for an empty array.
-- **`addConstraint` does not validate that `fields` is an array.** Passing a string (e.g. `addConstraint('users', 'notnullable', 'name')`) iterates over the individual characters of the string (`'n'`, `'a'`, `'m'`, `'e'`). Each character is checked against `config.values` and throws `InvalidMigrationError` for not being a known field name — the error message will reference individual characters rather than the intended field name.
+- **`addConstraint` with a non-array `fields` throws `TypeError`, not a `VitreousError`.** Elements of the array are checked against `config.values` and throw `InvalidMigrationError` if unknown.
 - **`watch()` on an `"object"` entity registers silently but fires no events.** `watch()` does not validate the entity type — it registers the callback regardless. Since object entities cannot have records inserted, the callback will never be invoked. No error is thrown.
 - **`watch()` on a non-existent entity also registers silently and never fires.** `watch()` does not check whether the entity exists at registration time. The callback is stored in `_watchers` keyed by entity name, but `_emit` is only reached via `_getTableConfig` which would throw `EntityNotFoundError` during any actual write — so the callback is never invoked. No error is thrown at `watch()` time.
 - **`watch()` callbacks survive entity deletion.** Calling `deleteEntity('foo')` does not clear entries from `_watchers`. If `'foo'` is later recreated with `createEntity` and records are inserted/updated/deleted, the old callbacks will fire again. Callers must call their unsubscribe function before deleting an entity if they want to avoid stale callback invocations.
@@ -269,14 +298,9 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 - **`addField` cannot add a field to the `nested` array.** `addField` only appends to `values`. There is no API to retroactively declare an existing field as a nested reference to an `"object"` entity without deleting and recreating the entity from scratch.
 - **`watch()` on a closed database registers silently without error.** `watch()` is synchronous and does not go through `_enqueue`, so it does not check `_closed`. After `db.close()`, calling `watch()` succeeds and stores the callback in `_watchers`, but the callback will never fire — all subsequent writes fail with `FileAccessError`. No error is thrown at registration time.
 - **`addConstraint('unique')` on an `id` field creates redundant and conflicting uniqueness checks.** There is no guard preventing `addConstraint(entity, 'unique', ['idField'])` on a field already declared in `id`. The `id` array already enforces composite-tuple uniqueness, but adding `unique` on an individual id field introduces a stricter per-field check. For entities with a composite id, two records that share the same individual id field value (but differ on other id fields, making the full tuple unique) would be rejected by the per-field `unique` check even though their composite id is valid.
-- **`update()` with a non-object `updates` argument throws a raw `TypeError`.** `deepMerge(existingRecord, updates)` calls `Object.keys(updates)` without type-checking `updates` first. Passing `null`, a number, or a boolean throws a native `TypeError` (e.g. `TypeError: Cannot convert undefined or null to object`) that is not wrapped in a `VitreousError`. Passing a string deep-merges on character indices, producing a corrupted record. Always pass a plain object as `updates`.
-- **`insert()` with a non-object `record` argument throws a raw `TypeError` or produces a corrupted record.** `normalizeMinusZero(rawRecord)` calls `Object.entries(rawRecord)` without type-checking first. Passing `null` or `undefined` throws `TypeError: Cannot convert undefined or null to object`. Passing a primitive string produces a record keyed by character indices (e.g. `{ '0': 'h', '1': 'i' }`), which bypasses validation and corrupts the entity. Always pass a plain object as `record`.
-- **`flush()` on a closed database is a silent no-op rather than throwing.** `flush()` does not check `_closed`. After `db.close()` sets `this._cache` to `null`, `flush()` exits early because `this._cache !== null` is `false` — no write occurs and no error is thrown. This is inconsistent with `_read()` and `_write()`, which both throw `FileAccessError('database is closed')`. Prefer `db.close()` for guaranteed flush; do not rely on `flush()` after `close()`.
+- **`flush()` is not enqueued.** It writes the current cache immediately without waiting for pending operations; prefer `db.close()` for a guaranteed final flush. After `close()`, `flush()` throws `FileAccessError('database is closed')`.
 - **`createEntity` does not validate that elements of `values` are strings.** The `values` array is verified as non-empty and duplicate-free, but individual elements are not type-checked. Passing `values: [1, null, {}]` is accepted silently. Subsequent operations may behave unpredictably because field-name comparisons use string equality — non-string entries will never match any real field name.
 - **`$exists` operator accepts any truthy/falsy value, not only booleans.** `applyOperators` evaluates `operand ?` without checking `typeof operand === 'boolean'`. As a result, `{ $exists: 1 }` behaves identically to `{ $exists: true }` and `{ $exists: 0 }` behaves identically to `{ $exists: false }`. No error is thrown for non-boolean operands.
-- **Nested entity lookup in `createEntity` does not use `hasOwnProperty`.** Step 9 of `createEntity` accesses `data.entitiesConfiguration[field]` directly. For a `nested` field whose name matches an `Object.prototype` property (e.g. `'constructor'`, `'toString'`), the lookup returns the prototype method instead of `undefined`. This causes `EntityTypeError` (type mismatch) instead of `EntityNotFoundError` (entity not registered). Avoid using `Object.prototype` property names as nested field names.
-- **`findWhere` function predicate receives raw (non-cloned) records.** At `RecordManager.js` line 285, `records.filter(matchFn)` passes the internal record objects directly to the predicate. If the predicate mutates a record (e.g. `r => { r.name = 'mutated'; return true; }`), it corrupts the in-memory state in eager mode without any error. Only the values *returned* by `findWhere` are cloned via `JSON.parse(JSON.stringify(...))`; the records passed to the predicate are not. The "Records are always cloned before being returned" convention applies to return values, not to predicate arguments.
-- **Concurrent operations inside `transaction()` with `Promise.all` bypass uniqueness constraints.** Inside a transaction the proxy `txDb._enqueue` calls functions directly without queuing (`_enqueue: (txFn) => txFn()`). If concurrent operations are launched with `Promise.all`, all of them read the same snapshot before any write occurs, each performs uniqueness validation against the pre-insertion state, all pass, and all then write to the same snapshot object — producing duplicate records that violate uniqueness constraints. Example: `await Promise.all([tx.recordManager.insert('users', { id: 1, email: 'a@b.com' }), tx.recordManager.insert('users', { id: 2, email: 'a@b.com' })])` inside a transaction callback inserts two records sharing a unique email. The intra-process mutex in `_enqueue` prevents this race on the real db, but the transaction proxy provides no such protection.
 - **`update()` with `{ field: undefined }` silently removes a top-level non-notnullable field.** `Object.keys({ field: undefined })` returns `['field']`, so `deepMerge` includes the key with value `undefined` in the merged result. Validation passes (NaN/Infinity check skips non-numbers; unique check skips `undefined`; notnullable check only throws if the field is declared notnullable). The subsequent `JSON.parse(JSON.stringify(...))` call then drops the key, because `JSON.stringify` omits `undefined` values. This provides an undocumented way to delete a top-level field by passing `undefined` as its value in `updates`. CLAUDE.md documents that `update()` cannot remove keys from *nested* objects, but this top-level side-effect is separate and distinct.
 
 ---
@@ -284,12 +308,12 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 ## Conventions
 
 - **All public methods are `async`** and return Promises, even when the underlying operation is synchronous. **Exception:** `RecordManager.watch()` is synchronous — it returns an unsubscribe function immediately, not a Promise. This matches the EventEmitter registration pattern. `watch()` throws `TypeError` synchronously if `callback` is not a function.
-- **Records are always cloned** (via `JSON.parse(JSON.stringify(...))`) before being returned. Callers must not mutate returned objects and expect the change to persist.
+- **Records are always cloned** (via `JSON.parse(JSON.stringify(...))`) before being returned, and before being passed to a `findWhere` function predicate. Callers must not mutate returned objects and expect the change to persist.
 - **Entity configs returned by `getEntity`, `createEntity`, and `addField` are cloned.** Mutating the returned object has no effect on the stored schema. `removeField` and `addConstraint` return `undefined`.
 - **`data` snapshots are mutated in-place** inside `_enqueue` callbacks before being passed to `_write`. This is safe because the mutex prevents concurrent access. **Critical:** all validation must run before any in-place mutation; in eager mode `_read()` returns `this._cache` directly, so a mutation before a failed validation would corrupt the cache with no rollback.
 - **No logging.** The module throws errors — it never logs to stdout or stderr.
 - **No optional chaining on `config` fields** unless the field is genuinely optional. All fields set by `createEntity` normalization (`id`, `notnullable`, `unique`, `nested`) are always arrays, never undefined.
-- **Watch callbacks must not throw.** `_emit` wraps each callback in `try/catch` and discards errors. A throwing callback does not abort the write and does not affect other callbacks. Callers are responsible for handling errors inside their own watchers.
+- **Watch callbacks must not throw or reject.** `_emit` wraps each callback in `try/catch` and, if the callback returns a thenable (i.e. is `async`), swallows the rejected promise via `.then(undefined, () => {})`. Neither a synchronous throw nor an async rejection aborts the write or affects other callbacks. Callers are responsible for handling errors inside their own watchers.
 - **Watch events carry deep-cloned records.** The `record` and `previous` properties in watch events are independent snapshots — mutating them has no effect on the database.
 - **Watch events fire only after a successful write.** `_emit` is called after `_write` returns. A failed operation (validation error, not-found, etc.) fires no event. Code building compensatory logic on watchers can safely assume each event represents a committed change.
 - **`unsubscribe()` is idempotent.** Calling it more than once is a safe no-op — the second call is silently ignored.
@@ -315,7 +339,7 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 node --test test/*.test.js
 ```
 
-Expected: **398 tests, 0 failures**.
+Expected: **452 tests, 0 failures**.
 
 The test suite includes:
 - `test/validator.test.js` — unit tests for Validator.js
@@ -331,5 +355,9 @@ The test suite includes:
 - `test/persistence.test.js` — persistence and error property checks
 - `test/integration.test.js` — end-to-end scenarios
 - `test/adversarial.test.js` — adversarial inputs and invariant enforcement
+- `test/subdatabase.test.js` — subdatabase containers
+- `test/sharded.test.js` — sharded containers
+- `test/shard_children.test.js` — subEntities children
+- `test/id_index.test.js` — eager-mode id index
 - `test/readme.test.js` — verifies README examples work correctly
 

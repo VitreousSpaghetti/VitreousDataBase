@@ -167,7 +167,12 @@ class RecordManager {
     const fns = this._watchers.get(entityName);
     if (!fns) return;
     for (const fn of fns) {
-      try { fn(event); } catch (_) {}
+      try {
+        const ret = fn(event);
+        if (ret !== null && typeof ret === 'object' && typeof ret.then === 'function') {
+          ret.then(undefined, () => {});
+        }
+      } catch (_) {}
     }
   }
 
@@ -663,7 +668,8 @@ class RecordManager {
 
       let matchFn;
       if (typeof predicate === 'function') {
-        matchFn = predicate;
+        // Predicates get a clone so a mutating predicate cannot corrupt the eager cache.
+        matchFn = r => predicate(JSON.parse(JSON.stringify(r)));
       } else if (isPlainObject(predicate)) {
         matchFn = r => deepMatch(r, predicate);
       } else {
