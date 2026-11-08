@@ -28,6 +28,17 @@ class Database {
     this._queue = Promise.resolve();
     this._closed = false;
 
+    // Cross-process lock (opt-in). One lock file guards main file + all sidecars.
+    this._multiProcess = Boolean(options.multiProcess);
+    this._lockPath = this._filePath + '.lock';
+    this._lockTimeout = options.lockTimeout === undefined ? 10000 : options.lockTimeout;
+    if (this._multiProcess && this._eager) {
+      throw new TypeError('multiProcess is not compatible with eager mode');
+    }
+    if (typeof this._lockTimeout !== 'number' || !Number.isFinite(this._lockTimeout) || this._lockTimeout <= 0) {
+      throw new TypeError('lockTimeout must be a positive finite number');
+    }
+
     // Eager-mode sidecar cache: relativeFilePath -> { payload, dirty }
     this._shardCache = new Map();
     // Per-sharded-entity manifest cache (always populated after first access)
@@ -64,6 +75,17 @@ class Database {
       throw new FileAccessError(this._filePath, `directory "${dir}" is not accessible`);
     }
 
+    if (!this._multiProcess) return this._initFile();
+    // Two processes opening a brand-new db at once must not both write EMPTY_DB.
+    await this._acquireLock();
+    try {
+      await this._initFile();
+    } finally {
+      await this._releaseLock();
+    }
+  }
+
+  async _initFile() {
     let fileExists = true;
     try {
       await fsPromises.access(this._filePath, fs.constants.F_OK);
@@ -129,9 +151,124 @@ class Database {
   }
 
   _enqueue(fn) {
-    const next = this._queue.then(fn);
+    const run = this._multiProcess
+      ? async () => {
+          await this._acquireLock();
+          try {
+            // Another process may have added shards since our last operation.
+            this._shardManifests.clear();
+            return await fn();
+          } finally {
+            await this._releaseLock();
+          }
+        }
+      : fn;
+    const next = this._queue.then(run);
     this._queue = next.catch(() => {});
     return next;
+  }
+
+  // ===========================================================================
+  // Cross-process lock (multiProcess mode only)
+  //
+  // `open(path, 'wx')` is O_CREAT|O_EXCL: atomic on Linux, macOS, BSD and Windows.
+  // The lock file holds the owner's pid. A lock whose pid is no longer alive is
+  // stale and gets broken. Same-machine only: pids and O_EXCL are not reliable
+  // on network filesystems (NFS/SMB).
+  // ponytail: one global lock per db; per-sidecar locks if cross-process throughput matters
+  // ===========================================================================
+
+  async _acquireLock() {
+    const deadline = Date.now() + this._lockTimeout;
+    let delay = 5;
+    for (;;) {
+      try {
+        const fh = await fsPromises.open(this._lockPath, 'wx');
+        try {
+          await fh.writeFile(String(process.pid), 'utf8');
+        } finally {
+          await fh.close();
+        }
+        return;
+      } catch (e) {
+        if (e.code !== 'EEXIST') {
+          throw new FileAccessError(this._lockPath, `cannot create lock file: ${e.message}`);
+        }
+      }
+      const stale = await this._isLockStale(this._lockPath);
+      if (stale) await this._breakStaleLock();
+      if (Date.now() >= deadline) {
+        throw new FileAccessError(this._lockPath, 'timed out waiting for lock');
+      }
+      if (stale) continue; // retry immediately after breaking
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 50);
+    }
+  }
+
+  async _releaseLock() {
+    try {
+      await fsPromises.unlink(this._lockPath);
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        throw new FileAccessError(this._lockPath, `cannot release lock: ${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * A lock is stale when its owner pid is dead. An empty/unparsable lock (owner
+   * crashed between open and write, or is writing right now) is stale only once
+   * it is older than lockTimeout.
+   */
+  async _isLockStale(lockPath) {
+    let raw, stat;
+    try {
+      [raw, stat] = await Promise.all([
+        fsPromises.readFile(lockPath, 'utf8'),
+        fsPromises.stat(lockPath),
+      ]);
+    } catch (e) {
+      return false; // vanished (or unreadable): just retry
+    }
+    const pid = Number(raw);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return Date.now() - stat.mtimeMs > this._lockTimeout;
+    }
+    try {
+      process.kill(pid, 0);
+      return false; // alive
+    } catch (e) {
+      return e.code === 'ESRCH'; // EPERM = alive, owned by another user
+    }
+  }
+
+  /**
+   * Removes a stale lock under a short-lived "breaker" lock, so two processes that
+   * both saw the same dead pid cannot delete each other's freshly acquired lock.
+   */
+  async _breakStaleLock() {
+    const breakPath = this._lockPath + '.break';
+    let fh;
+    try {
+      fh = await fsPromises.open(breakPath, 'wx');
+      await fh.writeFile(String(process.pid), 'utf8');
+      await fh.close();
+    } catch (e) {
+      if (fh) { try { await fh.close(); } catch { /* ignore */ } }
+      if (e.code === 'EEXIST' && await this._isLockStale(breakPath)) {
+        try { await fsPromises.unlink(breakPath); } catch { /* ignore */ }
+      }
+      return; // someone else is breaking it; caller retries
+    }
+    try {
+      // Re-check under the breaker: the lock may have been replaced meanwhile.
+      if (await this._isLockStale(this._lockPath)) {
+        try { await fsPromises.unlink(this._lockPath); } catch { /* ignore */ }
+      }
+    } finally {
+      try { await fsPromises.unlink(breakPath); } catch { /* ignore */ }
+    }
   }
 
   async _read() {

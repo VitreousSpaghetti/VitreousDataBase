@@ -16,8 +16,9 @@ A Node.js module (CommonJS, zero runtime dependencies) that uses a JSON file as 
 index.js                    public entry point — re-exports Database + all error classes
 src/errors.js               all custom error classes (extend VitreousError)
 src/Validator.js            pure validation functions — no side effects, no I/O
-src/Database.js             file I/O, eager mode, intra-process mutex, transaction(),
-                            sidecar container files (subdatabase/sharded), shard manifests
+src/Database.js             file I/O, eager mode, intra-process mutex, cross-process lock
+                            (multiProcess), transaction(), sidecar container files
+                            (subdatabase/sharded), shard manifests
 src/EntityManager.js        schema CRUD (createEntity, getEntity, listEntities, deleteEntity,
                             addField, removeField, addConstraint)
 src/RecordManager.js        data CRUD (insert, findById, findByIdSingle, findAll, findWhere,
@@ -39,6 +40,8 @@ test/subdatabase.test.js    integration tests for subdatabase containers
 test/sharded.test.js        integration tests for sharded containers
 test/shard_children.test.js integration tests for subEntities children (dotted paths, scope)
 test/id_index.test.js       eager-mode in-memory id index
+test/multiprocess.test.js   multiProcess lock (child processes, stale lock, timeout)
+test/fixtures/multiprocess_worker.js  child-process script used by multiprocess.test.js
 test/readme.test.js         verifies README examples work correctly
 ```
 
@@ -150,6 +153,9 @@ Recursive strict equality for plain objects and arrays. Used by `validateRecord`
 |------|-----------|------------|
 | Default | `fs.readFile` + JSON.parse | `_atomicWrite` (temp + rename) |
 | `{ eager: true }` | returns `this._cache` | updates `this._cache`, sets `_dirty = true` |
+| `{ multiProcess: true }` | same as Default, under `<dbfile>.lock` | same as Default, under `<dbfile>.lock` |
+
+`eager` + `multiProcess` together → `TypeError('multiProcess is not compatible with eager mode')` in the constructor (before any I/O). Reason: the eager cache is the source of truth until `flush()`, invisible to other processes; a flush would overwrite their writes.
 
 ### Mutex
 
@@ -166,7 +172,18 @@ All public operations are serialized through `_enqueue`. This prevents read-modi
 
 Each operation's failure is isolated: if an enqueued `fn` rejects, the rejection propagates to the caller via `next`, but `this._queue` is reset to a resolved promise via `.catch(() => {})`. Subsequent operations are therefore unaffected by a previous failure.
 
-> **Multi-process safety:** the mutex only covers a single process. Two concurrent processes can interleave their read-modify-write cycles regardless of mode. There is no cross-process file locking. Do not share a database file across processes without external coordination.
+> **Multi-process safety:** the mutex only covers a single process. Without `multiProcess: true`, two processes can interleave read-modify-write cycles and lose writes.
+
+### Cross-process lock (`multiProcess: true`)
+
+Options: `multiProcess` (default `false`), `lockTimeout` (ms, default `10000`, must be a positive finite number → `TypeError` otherwise).
+
+- `_enqueue` wraps every `fn` as: `_acquireLock()` → `_shardManifests.clear()` → `fn()` → `_releaseLock()` (in `finally`). One global lock per db covers main file + all sidecars + manifests. Reads take it too.
+- `_shardManifests.clear()` is required: in non-eager mode manifests are otherwise cached across operations and would miss shards created by other processes. `_idIndex` is eager-only, so it needs nothing.
+- `_init()` takes the lock around `_initFile()` so concurrent opens of a missing file write `EMPTY_DB` only once.
+- `_acquireLock()`: `fs.open(lockPath, 'wx')` (O_CREAT|O_EXCL, atomic on Linux/macOS/BSD/Windows), writes `process.pid`. On `EEXIST`: `_isLockStale` → pid dead (`process.kill(pid, 0)` throws `ESRCH`; `EPERM` = alive) or empty/unparsable lock older than `lockTimeout`. Stale locks are removed by `_breakStaleLock` under a `<lock>.break` breaker file (re-checks staleness before unlinking, so two breakers cannot delete each other's fresh lock). Otherwise backoff 5→50 ms; past `lockTimeout` → `FileAccessError(lockPath, 'timed out waiting for lock')`.
+- `transaction()` and `close()` go through `_enqueue` → one lock per call. Never call `_acquireLock` from inside an `_enqueue` callback (the lock is not re-entrant → self-timeout).
+- Limits: same machine only (pids, O_EXCL unreliable on NFS/SMB); global lock serializes unrelated entities; `watch()` sees only its own process's writes.
 
 ### `transaction(fn)`
 
@@ -258,6 +275,7 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 
 ## Known design limitations
 
+- **`multiProcess` is incompatible with `eager`.** Combining them throws `TypeError` at `Database.create()`. Multi-process safety exists only in default (non-eager) mode, on a local filesystem.
 - **One nested type per field name.** Because a nested field name must equal the `"object"` entity name, you cannot have two fields referencing the same structural type within one entity (e.g. `billingAddress` and `shippingAddress` both backed by `"address"`). Each must map to a separately named `"object"` entity.
 - **`update()` cannot remove keys from a nested object.** `deepMerge` can add or overwrite keys but not delete them. Setting a key to `null` leaves it present as `null`. The only workaround is to replace the entire nested field with a new object, or set the field itself to `null` (valid only if the field is not `notnullable`).
 - **`deepMerge()` replaces array fields entirely.** Arrays are not merged element-by-element — the incoming value overwrites the stored array completely. Only plain objects are deep-merged recursively.
@@ -339,7 +357,7 @@ When adding a new error, extend `VitreousError`, export it from `errors.js`, and
 node --test test/*.test.js
 ```
 
-Expected: **452 tests, 0 failures**.
+Expected: **461 tests, 0 failures**.
 
 The test suite includes:
 - `test/validator.test.js` — unit tests for Validator.js
@@ -359,5 +377,6 @@ The test suite includes:
 - `test/sharded.test.js` — sharded containers
 - `test/shard_children.test.js` — subEntities children
 - `test/id_index.test.js` — eager-mode id index
+- `test/multiprocess.test.js` — multiProcess cross-process lock
 - `test/readme.test.js` — verifies README examples work correctly
 

@@ -613,7 +613,7 @@ const allPeople = await db.recordManager.findAll('countries.person');
 - **Transactions do not support sidecar ops.** `db.transaction()` operates on the main-file snapshot only. Calling any sub/sharded record operation inside a transaction throws `ShardKeyError`. Combine a transaction with separate post-transaction sidecar ops if you need to mix them.
 - **Watch events fire on the dotted path.** Subscribe with `watch('countries.person', cb)` to receive child-entity events.
 - **Cross-shard uniqueness is not enforced.** If you need global uniqueness on a sharded entity, include the constraint field in `shardKey` (so each shard contains at most one matching value).
-- **Multi-process access is not safe** for sidecar files, exactly like the main file. Use a single process per database.
+- **Multi-process access** to sidecar files is safe only with `{ multiProcess: true }` (see [Multi-process access](#multi-process-access)). The lock covers the main file and every sidecar file together.
 
 ---
 
@@ -793,9 +793,37 @@ await db.close();
 // Calling close() a second time is a safe no-op — it returns immediately without flushing or throwing.
 ```
 
-> **Warning:** Neither mode is safe when multiple processes share the same file. There is no cross-process file locking. The in-process mutex (`_enqueue`) only serializes operations within a single process. In eager mode data races can cause silent overwrites; in default mode, concurrent read-modify-write cycles between processes can still interleave and lose writes. Use an external coordination mechanism (e.g. a dedicated server process) in multi-process environments.
+> **Warning:** Eager mode is never safe when multiple processes share the same file, and it cannot be combined with `multiProcess: true` (see [Multi-process access](#multi-process-access)). Use one process per database in eager mode.
 
 > **Eager mode data loss:** the emergency sync flush on `process.on('exit')` is not invoked on `SIGKILL` (`kill -9`), OOM termination, or `SIGTERM` without an explicit handler. Call `db.close()` or `db.flush()` before your process exits to guarantee data is written. Alternatively, register your own `SIGTERM`/`SIGINT` handlers that call `db.flush()` before exiting.
+
+---
+
+## Multi-process access
+
+By default the database is safe only inside a single process: the internal queue serializes operations within one process, but two processes can read the same file at the same time and the last write silently overwrites the other one. Enable `multiProcess` when several processes (e.g. cluster workers, CLI scripts, cron jobs) open the same database:
+
+```js
+const db = await Database.create('./mydata.json', {
+  multiProcess: true,   // cross-process lock around every operation
+  lockTimeout: 10000,   // optional, ms to wait for the lock (default 10000)
+});
+```
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `multiProcess` | `false` | Every operation (reads included) holds a lock file `<dbfile>.lock`. The lock covers the main file and all sidecar files (`<dbfile>.vdb/`). |
+| `lockTimeout` | `10000` | Max milliseconds to wait for the lock. On timeout the operation rejects with `FileAccessError` (`reason: 'timed out waiting for lock'`). Must be a positive finite number, otherwise `create()` throws `TypeError`. |
+
+How it works: the lock file is created with `open(path, 'wx')` (`O_CREAT | O_EXCL`), which is atomic on Linux, macOS, BSD and Windows. It contains the owner's pid; a lock left by a crashed process (pid no longer alive) is detected and removed automatically. `db.transaction()` holds the lock once for the whole transaction.
+
+> **Not compatible with eager mode.** `Database.create(file, { eager: true, multiProcess: true })` throws `TypeError('multiProcess is not compatible with eager mode')` before touching the disk. In eager mode the in-memory cache is the source of truth until `flush()`: other processes cannot see it, and the flush would overwrite their writes. Re-reading the file on every operation would remove the whole point of eager mode.
+
+Limitations:
+- **Same machine only.** Stale-lock detection relies on pids, and `O_EXCL` is not reliable on network filesystems (NFS, SMB). Do not use it on shared network drives.
+- **One global lock per database.** Operations from different processes run one at a time, even on unrelated entities or shards.
+- **`watch()` only sees writes made by its own process.** Writes from other processes do not fire callbacks.
+- With `multiProcess: false` (default) nothing changes: no lock file, no overhead.
 
 ---
 
@@ -968,11 +996,14 @@ The test suite includes:
 - `test/sharded.test.js` — `sharded` containers
 - `test/shard_children.test.js` — child entities inside containers
 - `test/id_index.test.js` — eager-mode in-memory id index
+- `test/multiprocess.test.js` — `multiProcess` cross-process lock (concurrent child processes, stale locks, timeout)
 - `test/readme.test.js` — verifies README examples work correctly
 
 ---
 
 ## Known limitations
+
+- **`multiProcess` and `eager` cannot be combined.** Passing both throws `TypeError`. Multi-process access works only in the default (non-eager) mode, on a local filesystem. See [Multi-process access](#multi-process-access).
 
 - **Limited schema migration.** `addField`, `removeField`, and `addConstraint` cover common evolution patterns. Renaming a field, changing its type, or changing `id` composition still requires deleting and recreating the entity (destroying all its records).
 
